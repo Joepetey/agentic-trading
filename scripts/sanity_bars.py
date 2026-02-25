@@ -2,16 +2,17 @@
 
 from datetime import datetime
 
-from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.requests import StockBarsRequest
 from alpaca.data.timeframe import TimeFrame
 
-from src.core import load_settings
+from src.alpaca import AlpacaDataClient
+from src.core import load_settings, setup_logging
 
 
 def main() -> None:
+    setup_logging()
     cfg = load_settings()
-    client = StockHistoricalDataClient(cfg.alpaca.api_key, cfg.alpaca.api_secret)
+    client = AlpacaDataClient(cfg.alpaca)
 
     request = StockBarsRequest(
         symbol_or_symbols=["AAPL"],
@@ -21,7 +22,7 @@ def main() -> None:
     )
     bars = client.get_stock_bars(request)
 
-    print(f"Fetched {len(bars.df)} bars for AAPL:\n")
+    print(f"\nFetched {len(bars.df)} bars for AAPL:\n")
     print(bars.df.to_string())
 
 

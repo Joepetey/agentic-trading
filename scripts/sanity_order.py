@@ -1,20 +1,24 @@
 """Sanity check: submit a tiny paper market order via Alpaca."""
 
-from alpaca.trading.client import TradingClient
+import structlog
 from alpaca.trading.enums import OrderSide, TimeInForce
 from alpaca.trading.requests import MarketOrderRequest
 
-from src.core import Environment, load_settings
+from src.alpaca import AlpacaTradingClient
+from src.core import Environment, load_settings, setup_logging
+
+log = structlog.get_logger()
 
 
 def main() -> None:
+    setup_logging()
     cfg = load_settings()
 
     if cfg.alpaca.env != Environment.PAPER:
-        print("ABORT: this script only runs against paper. Set TRADING_ENV=paper.")
+        log.error("refusing_live_order", env=cfg.alpaca.env.value)
         raise SystemExit(1)
 
-    client = TradingClient(cfg.alpaca.api_key, cfg.alpaca.api_secret, paper=True)
+    client = AlpacaTradingClient(cfg.alpaca)
 
     order = client.submit_order(
         MarketOrderRequest(
@@ -25,7 +29,7 @@ def main() -> None:
         )
     )
 
-    print(f"Order submitted:")
+    print(f"\nOrder submitted:")
     print(f"  id:     {order.id}")
     print(f"  symbol: {order.symbol}")
     print(f"  side:   {order.side}")
