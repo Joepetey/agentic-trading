@@ -53,3 +53,7 @@ class RiskViolation(TradingError):
 
 class OrderError(TradingError):
     """Order submission or reconciliation failure."""
+
+
+class StaleDataError(TradingError):
+    """Latest bar is older than the staleness threshold."""

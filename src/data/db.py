@@ -74,6 +74,23 @@ CREATE TABLE IF NOT EXISTS ingest_state (
 CREATE INDEX IF NOT EXISTS ingest_state_status_idx
   ON ingest_state(status);
 
+CREATE TABLE IF NOT EXISTS data_gaps (
+  gap_id        TEXT PRIMARY KEY,
+  symbol        TEXT NOT NULL,
+  timeframe     TEXT NOT NULL,
+  gap_start     TEXT NOT NULL,
+  gap_end       TEXT NOT NULL,
+  expected_bars INTEGER,
+  status        TEXT NOT NULL DEFAULT 'open',
+  detected_at   TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  resolved_at   TEXT,
+  repair_run_id TEXT,
+  FOREIGN KEY (symbol) REFERENCES symbols(symbol)
+) WITHOUT ROWID;
+
+CREATE INDEX IF NOT EXISTS data_gaps_status_idx
+  ON data_gaps(status);
+
 CREATE TABLE IF NOT EXISTS ingest_runs (
   run_id       TEXT PRIMARY KEY,
   started_at   TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),

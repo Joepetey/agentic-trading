@@ -18,6 +18,7 @@ from src.core.errors import (
     ConfigError,
     OrderError,
     RiskViolation,
+    StaleDataError,
     TradingError,
 )
 from src.core.logging import setup_logging
@@ -36,6 +37,7 @@ __all__ = [
     "RiskLimits",
     "RiskViolation",
     "Settings",
+    "StaleDataError",
     "SymbolUniverse",
     "TradingError",
     "load_settings",
