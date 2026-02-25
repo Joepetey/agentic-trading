@@ -57,3 +57,14 @@ class OrderError(TradingError):
 
 class StaleDataError(TradingError):
     """Latest bar is older than the staleness threshold."""
+
+
+# ── Strategy errors ───────────────────────────────────────────────────
+
+
+class StrategyError(TradingError):
+    """Base for all strategy-layer errors."""
+
+
+class InsufficientDataError(StrategyError):
+    """Strategy needs more bars than are available."""
