@@ -9,5 +9,9 @@ wheels/
 # Virtual environments
 .venv
 
+# Database
+db/*
+!db/.gitkeep
+
 # Secrets
 .env

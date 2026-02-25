@@ -3,6 +3,7 @@
 from src.core.config import (
     AlpacaConfig,
     Environment,
+    IngestConfig,
     RiskLimits,
     Settings,
     SymbolUniverse,
@@ -25,6 +26,7 @@ __all__ = [
     "AlpacaAPIError",
     "AlpacaAuthError",
     "AlpacaConfig",
+    "IngestConfig",
     "AlpacaError",
     "AlpacaNetworkError",
     "AlpacaRateLimitError",

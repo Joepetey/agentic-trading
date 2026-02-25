@@ -41,6 +41,15 @@ class SymbolUniverse(BaseModel):
     symbols: list[str] = Field(default_factory=list)
 
 
+class IngestConfig(BaseModel):
+    timeframes: list[str] = Field(default_factory=lambda: ["1Day", "5Min"])
+    lookback: dict[str, int] = Field(
+        default_factory=lambda: {"1Day": 730, "5Min": 30},
+        description="Calendar days to look back per timeframe",
+    )
+    feed: str = Field(default="iex", description="Alpaca data feed: 'iex' (free) or 'sip' (paid)")
+
+
 class RiskLimits(BaseModel):
     max_position_pct: float = Field(
         default=0.05, description="Max fraction of portfolio in a single position"
@@ -59,6 +68,7 @@ class RiskLimits(BaseModel):
 class Settings(BaseModel):
     alpaca: AlpacaConfig
     symbols: SymbolUniverse = Field(default_factory=SymbolUniverse)
+    ingest: IngestConfig = Field(default_factory=IngestConfig)
     risk: RiskLimits = Field(default_factory=RiskLimits)
 
 
@@ -111,5 +121,6 @@ def load_settings(config_path: Path | None = None) -> Settings:
             base_url=base_url,
         ),
         symbols=SymbolUniverse(**file_cfg.get("symbols", {})),
+        ingest=IngestConfig(**file_cfg.get("ingest", {})),
         risk=RiskLimits(**file_cfg.get("risk", {})),
     )

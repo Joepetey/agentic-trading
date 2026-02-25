@@ -14,6 +14,14 @@ symbols = [
     "QQQ",
 ]
 
+[ingest]
+timeframes = ["1Day", "5Min"]
+feed = "iex"
+
+[ingest.lookback]
+"1Day" = 730
+"5Min" = 30
+
 [risk]
 max_position_pct = 0.05
 max_portfolio_exposure_pct = 0.90
