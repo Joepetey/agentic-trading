@@ -37,6 +37,14 @@ max_stale_pct = 0.50
 "1Day" = 2880
 "5Min" = 30
 
+[orchestrator.cost_bps]
+"1Day" = 5.0
+"5Min" = 3.0
+
+[orchestrator.edge_scales]
+# Per-strategy calibration, default 1.0
+# tqqq_weekly = 1.2
+
 [strategies]
 enabled = ["sma_crossover", "mean_reversion", "momentum", "tqqq_weekly"]
 

@@ -121,7 +121,11 @@ def _size_signal_weighted(
     if not signals:
         return []
 
-    raw_weights = [abs(m.agg_strength) * m.agg_confidence for m in signals]
+    raw_weights = [
+        abs(m.agg_alpha) if m.agg_alpha is not None
+        else abs(m.agg_strength) * m.agg_confidence
+        for m in signals
+    ]
     total_raw = sum(raw_weights)
 
     if total_raw < 1e-12:

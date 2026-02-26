@@ -162,6 +162,47 @@ class TestShortTargets:
         assert targets[0].target_notional < 0
 
 
+class TestAggAlphaSizing:
+    """Tests for agg_alpha-based sizing."""
+
+    def test_agg_alpha_used_for_proportional_allocation(self):
+        """When agg_alpha is set, SIGNAL_WEIGHTED uses it instead of strength*confidence."""
+        s_strong = _merged(symbol="AAPL", agg_strength=0.3, agg_confidence=0.3)
+        s_weak = _merged(symbol="MSFT", agg_strength=0.9, agg_confidence=0.9)
+
+        # Override agg_alpha: AAPL gets high alpha, MSFT gets low
+        s_strong = MergedSignal(
+            **{**s_strong.model_dump(), "agg_alpha": 0.8},
+        )
+        s_weak = MergedSignal(
+            **{**s_weak.model_dump(), "agg_alpha": 0.1},
+        )
+
+        targets = compute_targets(
+            [s_strong, s_weak], _portfolio(),
+            _risk(max_position_pct=0.50),
+        )
+
+        aapl = next(t for t in targets if t.symbol == "AAPL")
+        msft = next(t for t in targets if t.symbol == "MSFT")
+        # Despite lower agg_strength, AAPL gets more due to higher agg_alpha
+        assert aapl.target_notional > msft.target_notional
+
+    def test_agg_alpha_none_falls_back(self):
+        """When agg_alpha is None, falls back to |agg_strength| * agg_confidence."""
+        s1 = _merged(symbol="AAPL", agg_strength=0.9, agg_confidence=0.9)
+        s2 = _merged(symbol="MSFT", agg_strength=0.3, agg_confidence=0.5)
+        # agg_alpha defaults to None → classic formula
+        targets = compute_targets(
+            [s1, s2], _portfolio(),
+            _risk(max_position_pct=0.50),
+        )
+
+        aapl = next(t for t in targets if t.symbol == "AAPL")
+        msft = next(t for t in targets if t.symbol == "MSFT")
+        assert aapl.target_notional > msft.target_notional
+
+
 class TestEdgeCases:
     def test_empty_signals(self):
         targets = compute_targets([], _portfolio(), _risk())

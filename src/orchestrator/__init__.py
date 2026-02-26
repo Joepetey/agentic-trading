@@ -1,6 +1,7 @@
 """Orchestrator — decision cycle from signals to portfolio intent."""
 
 from src.orchestrator.deconflict import deconflict_signals
+from src.orchestrator.normalize import normalize_signals
 from src.orchestrator.intent_persist import (
     ensure_intent_schema,
     generate_intent_id,
@@ -35,6 +36,7 @@ __all__ = [
     "resolve_eval_ts",
     "EvalTimestampResult",
     "filter_universe",
+    "normalize_signals",
     "deconflict_signals",
     "compute_targets",
     # Models

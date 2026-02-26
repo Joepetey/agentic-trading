@@ -81,6 +81,14 @@ class OrchestratorConfig(BaseModel):
         default="1Day",
         description="Timeframe used for eval_ts resolution",
     )
+    cost_bps: dict[str, float] = Field(
+        default_factory=lambda: {"1Day": 5.0, "5Min": 3.0, "1Min": 2.0},
+        description="Round-trip cost estimate per timeframe in basis points",
+    )
+    edge_scales: dict[str, float] = Field(
+        default_factory=dict,
+        description="Per-strategy edge calibration scale (default 1.0, updated from backtests)",
+    )
 
 
 class StrategyEntry(BaseModel):

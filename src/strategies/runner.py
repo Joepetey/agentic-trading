@@ -51,15 +51,24 @@ class RunResult(BaseModel):
 # ── Internals ────────────────────────────────────────────────────────
 
 
-def _validate_signals(signals: Any, strategy_id: str) -> list[Signal]:
+def _validate_signals(
+    signals: Any,
+    strategy_id: str,
+    universe: tuple[str, ...],
+) -> list[Signal]:
     """Validate the return value from ``Strategy.run()``.
 
     Raises StrategyError on type mismatches or mismatched strategy_id.
+    Belt-and-suspenders: drops signals for symbols not in the universe
+    (the deconfliction step also filters these, but catching early is safer).
     """
     if not isinstance(signals, list):
         raise StrategyError(
             f"{strategy_id}.run() returned {type(signals).__name__}, expected list"
         )
+
+    universe_set = set(universe)
+    validated: list[Signal] = []
 
     for sig in signals:
         if not isinstance(sig, Signal):
@@ -71,8 +80,38 @@ def _validate_signals(signals: Any, strategy_id: str) -> list[Signal]:
                 f"Signal strategy_id {sig.strategy_id!r} "
                 f"does not match {strategy_id!r}"
             )
+        if sig.symbol not in universe_set:
+            logger.warning(
+                "signal_out_of_universe",
+                strategy_id=strategy_id,
+                symbol=sig.symbol,
+                universe_size=len(universe),
+            )
+            continue
 
-    return signals
+        validated.append(sig)
+
+    return validated
+
+
+def _stamp_metadata(
+    signals: list[Signal],
+    strategy: Strategy,
+    cycle_id: str,
+) -> list[Signal]:
+    """Stamp runner metadata onto validated signals.
+
+    Since Signal is frozen, creates enriched copies via model_copy().
+    """
+    if not signals:
+        return signals
+
+    update = {
+        "strategy_version": strategy.version,
+        "params_hash": strategy.params_hash,
+        "cycle_id": cycle_id,
+    }
+    return [sig.model_copy(update=update) for sig in signals]
 
 
 def _run_one(strategy: Strategy, ctx: StrategyContext) -> list[Signal]:
@@ -81,7 +120,7 @@ def _run_one(strategy: Strategy, ctx: StrategyContext) -> list[Signal]:
     This function runs inside a worker thread when parallel mode is used.
     """
     result = strategy.run(ctx)
-    return _validate_signals(result, strategy.strategy_id)
+    return _validate_signals(result, strategy.strategy_id, ctx.universe)
 
 
 # ── Runner ────────────────────────────────────────────────────────────
@@ -95,6 +134,7 @@ def run_strategies(
     config_map: dict[str, dict[str, Any]] | None = None,
     constraints: Constraints | None = None,
     *,
+    cycle_id: str = "",
     max_workers: int = 1,
     strategy_timeout_secs: float | None = _DEFAULT_TIMEOUT_SECS,
     persist: bool = False,
@@ -118,6 +158,7 @@ def run_strategies(
         now_ts:          Point-in-time for evaluation.
         config_map:      Per-strategy config dicts, keyed by strategy_id.
         constraints:     Pre-evaluation filters.
+        cycle_id:        Orchestrator intent_id to stamp onto each signal.
         max_workers:     Thread-pool size.  ``1`` → sequential (no pool).
         strategy_timeout_secs:
             Per-strategy time budget in seconds.  ``None`` → no limit.
@@ -185,9 +226,9 @@ def run_strategies(
     if max_workers <= 1 or len(strategies) <= 1:
         # Fast path: no thread-pool overhead.
         for strategy, ctx in prepared:
-            _execute_strategy(strategy, ctx, strategy_timeout_secs, signals, errors, run_log)
+            _execute_strategy(strategy, ctx, strategy_timeout_secs, cycle_id, signals, errors, run_log)
     else:
-        _execute_parallel(prepared, max_workers, strategy_timeout_secs, signals, errors, run_log)
+        _execute_parallel(prepared, max_workers, strategy_timeout_secs, cycle_id, signals, errors, run_log)
 
     # ── Phase 3: aggregate results ──────────────────────────────────
     elapsed_ms = (time.monotonic() - t0) * 1000
@@ -244,6 +285,7 @@ def _execute_strategy(
     strategy: Strategy,
     ctx: StrategyContext,
     timeout_secs: float | None,
+    cycle_id: str,
     signals: list[Signal],
     errors: list[StrategyRunError],
     run_log: Any,
@@ -269,6 +311,7 @@ def _execute_strategy(
         else:
             result = _run_one(strategy, ctx)
 
+        result = _stamp_metadata(result, strategy, cycle_id)
         signals.extend(result)
         strat_log.info("strategy_complete", signal_count=len(result))
 
@@ -301,6 +344,7 @@ def _execute_parallel(
     prepared: list[tuple[Strategy, StrategyContext]],
     max_workers: int,
     timeout_secs: float | None,
+    cycle_id: str,
     signals: list[Signal],
     errors: list[StrategyRunError],
     run_log: Any,
@@ -321,6 +365,7 @@ def _execute_parallel(
 
             try:
                 result = future.result(timeout=timeout_secs)
+                result = _stamp_metadata(result, strategy, cycle_id)
                 signals.extend(result)
                 strat_log.info("strategy_complete", signal_count=len(result))
 

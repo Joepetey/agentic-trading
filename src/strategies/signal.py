@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import functools
+import uuid
 from datetime import datetime
 from enum import Enum
 from typing import Any
@@ -67,6 +68,7 @@ class Signal(BaseModel):
 
     model_config = ConfigDict(frozen=True)
 
+    # ── Core fields (set by strategy) ────────────────────────────────
     strategy_id: str
     symbol: str
     side: Side
@@ -81,6 +83,28 @@ class Signal(BaseModel):
     invalidate: tuple[InvalidateCondition, ...] = ()
     tags: tuple[str, ...] = ()
     explain: str = ""
+
+    # ── Metadata (stamped by runner, not set by strategies) ────────
+    signal_id: str = Field(
+        default_factory=lambda: uuid.uuid4().hex,
+        description="Unique identifier for this signal instance",
+    )
+    cycle_id: str = Field(
+        default="",
+        description="Orchestrator intent_id linking this signal to a decision cycle",
+    )
+    strategy_version: str = Field(
+        default="",
+        description="Strategy semver, stamped by the runner after execution",
+    )
+    params_hash: str = Field(
+        default="",
+        description="Strategy params hash for reproducibility, stamped by runner",
+    )
+    alpha_net: float | None = Field(
+        default=None,
+        description="Net alpha after calibration and cost, stamped by normalize step",
+    )
 
     # ── validators ────────────────────────────────────────────────────
 

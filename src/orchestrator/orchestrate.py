@@ -11,6 +11,7 @@ import structlog
 
 from src.core.config import OrchestratorConfig, RiskLimits
 from src.orchestrator.deconflict import deconflict_signals
+from src.orchestrator.normalize import normalize_signals
 from src.orchestrator.intent_persist import (
     ensure_intent_schema,
     generate_intent_id,
@@ -190,6 +191,7 @@ def orchestrate(
         now_ts=eval_ts,
         config_map=config_map,
         constraints=constraints,
+        cycle_id=intent_id,
         max_workers=max_workers,
         strategy_timeout_secs=strategy_timeout_secs,
         persist=persist,
@@ -201,11 +203,27 @@ def orchestrate(
         elapsed_ms=run_result.elapsed_ms,
     )
 
-    # ── Step 3: Deconflict signals ───────────────────────────────────
-    merged_signals, dropped_signals = deconflict_signals(
+    # ── Step 2.5: Normalize signals ─────────────────────────────────
+    normalized_signals = normalize_signals(
         signals=run_result.signals,
-        universe=universe_result.included,
+        timeframe=orch_cfg.primary_timeframe,
         strategy_weights=strategy_weights,
+        edge_scales=orch_cfg.edge_scales,
+        cost_bps=orch_cfg.cost_bps,
+    )
+    orch_log.info(
+        "signals_normalized",
+        total=len(normalized_signals),
+        zero_alpha=sum(
+            1 for s in normalized_signals if s.alpha_net == 0.0
+        ),
+    )
+
+    # ── Step 3: Deconflict signals ───────────────────────────────────
+    # strategy_weights already baked into alpha_net by normalization
+    merged_signals, dropped_signals = deconflict_signals(
+        signals=normalized_signals,
+        universe=universe_result.included,
     )
     orch_log.info(
         "signals_deconflicted",

@@ -20,6 +20,31 @@ logger = structlog.get_logger(__name__)
 _DEFAULT_STRATEGY_WEIGHT = 1.0
 
 
+def _effective_weight(sig: Signal, strategy_weights: dict[str, float]) -> float:
+    """Effective voting weight for a signal.
+
+    If ``alpha_net`` is set (normalization ran), use its absolute value.
+    Otherwise fall back to the classic ``|strength| * confidence * weight``.
+    """
+    if sig.alpha_net is not None:
+        return abs(sig.alpha_net)
+    w = strategy_weights.get(sig.strategy_id, _DEFAULT_STRATEGY_WEIGHT)
+    return abs(sig.strength) * sig.confidence * w
+
+
+def _net_vote_contribution(sig: Signal, strategy_weights: dict[str, float]) -> float:
+    """Signed vote contribution for directional consensus.
+
+    If ``alpha_net`` is set, use it directly (already signed).
+    Otherwise compute from strength/confidence/weight.
+    """
+    if sig.alpha_net is not None:
+        return sig.alpha_net
+    w = strategy_weights.get(sig.strategy_id, _DEFAULT_STRATEGY_WEIGHT)
+    vote = abs(sig.strength) * sig.confidence * w
+    return -vote if sig.side == Side.SHORT else vote
+
+
 def deconflict_signals(
     signals: list[Signal],
     universe: tuple[str, ...],
@@ -29,11 +54,11 @@ def deconflict_signals(
 
     Algorithm per symbol:
     1. Drop signals for symbols not in the filtered universe.
-    2. Drop zero-strength signals.
+    2. Drop zero-strength signals (or zero-alpha_net if normalized).
     3. Separate exit intents (FLAT with negative strength) from directional.
     4. If only exits → build FLAT merged signal.
     5. If exits AND directional → weighted-vote contest; exit wins ties.
-    6. For directional: weighted side consensus via |strength| * confidence * weight.
+    6. For directional: weighted side consensus via effective weight.
     7. Keep same-side signals, drop opposite-side.
     8. Weighted-average merge for final MergedSignal.
     9. Pass through tightest stop, nearest TP from any contributor.
@@ -42,6 +67,8 @@ def deconflict_signals(
         signals:           Validated Signal objects from Phase 2.
         universe:          Filtered universe (signals for excluded symbols dropped).
         strategy_weights:  Optional per-strategy_id weight multiplier.
+                           Ignored when signals carry alpha_net (normalization
+                           already baked weights in).
 
     Returns:
         Tuple of (merged_signals, dropped_signals).
@@ -66,7 +93,20 @@ def deconflict_signals(
             ))
             continue
 
-        # Drop zero-strength signals
+        # Drop signals where normalization zeroed out alpha (cost ate the alpha)
+        if sig.alpha_net is not None and sig.alpha_net == 0.0:
+            dropped.append(DroppedSignal(
+                strategy_id=sig.strategy_id,
+                symbol=sig.symbol,
+                side=sig.side.value,
+                strength=sig.strength,
+                confidence=sig.confidence,
+                reason=DropReason.BELOW_COST_THRESHOLD,
+                detail="alpha_net=0 after cost subtraction",
+            ))
+            continue
+
+        # Drop zero-strength signals (un-normalized path)
         if sig.strength == 0.0:
             dropped.append(DroppedSignal(
                 strategy_id=sig.strategy_id,
@@ -129,12 +169,10 @@ def _merge_symbol_signals(
     # Both exits and directional → weighted contest
     if exit_sigs and directional_sigs:
         exit_weight = sum(
-            abs(s.strength) * s.confidence * strategy_weights.get(s.strategy_id, _DEFAULT_STRATEGY_WEIGHT)
-            for s in exit_sigs
+            _effective_weight(s, strategy_weights) for s in exit_sigs
         )
         dir_weight = sum(
-            abs(s.strength) * s.confidence * strategy_weights.get(s.strategy_id, _DEFAULT_STRATEGY_WEIGHT)
-            for s in directional_sigs
+            _effective_weight(s, strategy_weights) for s in directional_sigs
         )
 
         # Exit wins ties (safe default)
@@ -163,15 +201,9 @@ def _merge_symbol_signals(
                 ))
 
     # Directional consensus via weighted vote
-    net_vote = 0.0
-    for s in directional_sigs:
-        w = strategy_weights.get(s.strategy_id, _DEFAULT_STRATEGY_WEIGHT)
-        vote = abs(s.strength) * s.confidence * w
-        if s.side == Side.SHORT:
-            net_vote -= vote
-        else:
-            # LONG or FLAT-with-positive-strength both treated as long direction
-            net_vote += vote
+    net_vote = sum(
+        _net_vote_contribution(s, strategy_weights) for s in directional_sigs
+    )
 
     # Perfect cancellation
     if abs(net_vote) < 1e-9:
@@ -223,17 +255,22 @@ def _build_directional_merged(
     total_weight = 0.0
     weighted_strength = 0.0
     weighted_confidence = 0.0
+    weighted_alpha = 0.0
+    has_alpha = False
     min_horizon = float("inf")
     tightest_stop: float | None = None
     nearest_tp: float | None = None
 
     for s in sigs:
-        w = strategy_weights.get(s.strategy_id, _DEFAULT_STRATEGY_WEIGHT)
-        effective_weight = abs(s.strength) * s.confidence * w
-        total_weight += effective_weight
-        weighted_strength += s.strength * effective_weight
-        weighted_confidence += s.confidence * effective_weight
+        ew = _effective_weight(s, strategy_weights)
+        total_weight += ew
+        weighted_strength += s.strength * ew
+        weighted_confidence += s.confidence * ew
         min_horizon = min(min_horizon, s.horizon_bars)
+
+        if s.alpha_net is not None:
+            has_alpha = True
+            weighted_alpha += s.alpha_net * ew
 
         if s.stop_price is not None:
             if tightest_stop is None:
@@ -256,18 +293,21 @@ def _build_directional_merged(
             side=s.side.value,
             strength=s.strength,
             confidence=s.confidence,
-            weight=round(effective_weight, 6),
+            weight=round(ew, 6),
             horizon_bars=s.horizon_bars,
+            alpha_net=s.alpha_net,
         ))
 
     agg_strength = weighted_strength / total_weight if total_weight > 0 else 0.0
     agg_confidence = weighted_confidence / total_weight if total_weight > 0 else 0.0
+    agg_alpha = (weighted_alpha / total_weight) if (has_alpha and total_weight > 0) else None
 
     return MergedSignal(
         symbol=symbol,
         side=side,
         agg_strength=agg_strength,
         agg_confidence=agg_confidence,
+        agg_alpha=agg_alpha,
         horizon_bars=int(min_horizon) if min_horizon != float("inf") else 1,
         stop_hint=tightest_stop,
         tp_hint=nearest_tp,
@@ -285,27 +325,37 @@ def _build_exit_merged(
     total_weight = 0.0
     weighted_strength = 0.0
     weighted_confidence = 0.0
+    weighted_alpha = 0.0
+    has_alpha = False
 
     for s in sigs:
-        w = strategy_weights.get(s.strategy_id, _DEFAULT_STRATEGY_WEIGHT)
-        effective_weight = abs(s.strength) * s.confidence * w
-        total_weight += effective_weight
-        weighted_strength += s.strength * effective_weight
-        weighted_confidence += s.confidence * effective_weight
+        ew = _effective_weight(s, strategy_weights)
+        total_weight += ew
+        weighted_strength += s.strength * ew
+        weighted_confidence += s.confidence * ew
+
+        if s.alpha_net is not None:
+            has_alpha = True
+            weighted_alpha += s.alpha_net * ew
+
         contributions.append(SignalContribution(
             strategy_id=s.strategy_id,
             side=s.side.value,
             strength=s.strength,
             confidence=s.confidence,
-            weight=round(effective_weight, 6),
+            weight=round(ew, 6),
             horizon_bars=s.horizon_bars,
+            alpha_net=s.alpha_net,
         ))
+
+    agg_alpha = (weighted_alpha / total_weight) if (has_alpha and total_weight > 0) else None
 
     return MergedSignal(
         symbol=symbol,
         side="flat",
         agg_strength=weighted_strength / total_weight if total_weight > 0 else 0.0,
         agg_confidence=weighted_confidence / total_weight if total_weight > 0 else 0.0,
+        agg_alpha=agg_alpha,
         horizon_bars=1,
         contributions=tuple(contributions),
     )

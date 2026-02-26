@@ -249,6 +249,72 @@ class TestDeterminism:
             assert m1.agg_confidence == pytest.approx(m2.agg_confidence)
 
 
+class TestAlphaNet:
+    """Tests for alpha_net-aware deconfliction."""
+
+    def test_alpha_net_used_for_voting(self):
+        """Signals with alpha_net use it for effective weight."""
+        s_long = _sig(strategy_id="strat_a", strength=0.5, confidence=0.8)
+        s_short = _sig(strategy_id="strat_b", side=Side.SHORT, strength=0.5, confidence=0.8)
+
+        # Without alpha_net, these cancel (equal |strength| * confidence)
+        merged, _ = deconflict_signals([s_long, s_short], UNIVERSE)
+        assert len(merged) == 0
+
+        # With alpha_net, strat_a has 2x the weight → LONG wins
+        s_long_normed = s_long.model_copy(update={"alpha_net": 0.8})
+        s_short_normed = s_short.model_copy(update={"alpha_net": -0.2})
+        merged, dropped = deconflict_signals([s_long_normed, s_short_normed], UNIVERSE)
+        assert len(merged) == 1
+        assert merged[0].side == "long"
+
+    def test_alpha_net_zero_dropped(self):
+        """Signals with alpha_net=0.0 are dropped as BELOW_COST_THRESHOLD."""
+        sig = _sig(strength=0.5, confidence=0.8)
+        sig_zero = sig.model_copy(update={"alpha_net": 0.0})
+        merged, dropped = deconflict_signals([sig_zero], UNIVERSE)
+
+        assert len(merged) == 0
+        assert len(dropped) == 1
+        assert dropped[0].reason == DropReason.BELOW_COST_THRESHOLD
+
+    def test_agg_alpha_in_merged(self):
+        """MergedSignal carries agg_alpha when signals have alpha_net."""
+        sig = _sig(strength=0.8, confidence=0.9)
+        sig_normed = sig.model_copy(update={"alpha_net": 0.6})
+        merged, _ = deconflict_signals([sig_normed], UNIVERSE)
+
+        assert len(merged) == 1
+        assert merged[0].agg_alpha == pytest.approx(0.6)
+
+    def test_agg_alpha_none_without_normalization(self):
+        """MergedSignal.agg_alpha is None when signals lack alpha_net."""
+        sig = _sig()
+        merged, _ = deconflict_signals([sig], UNIVERSE)
+
+        assert len(merged) == 1
+        assert merged[0].agg_alpha is None
+
+    def test_backward_compat_no_alpha_net(self):
+        """Signals without alpha_net (None) use classic weight formula."""
+        s1 = _sig(strategy_id="strat_a", strength=0.8, confidence=0.9)
+        s2 = _sig(strategy_id="strat_b", strength=0.6, confidence=0.7)
+        merged, _ = deconflict_signals([s1, s2], UNIVERSE)
+
+        assert len(merged) == 1
+        assert merged[0].side == "long"
+        # Classic formula: agg_strength is weighted average
+        assert 0.6 < merged[0].agg_strength < 0.8
+
+    def test_contribution_carries_alpha_net(self):
+        """SignalContribution records alpha_net for audit."""
+        sig = _sig(strength=0.8, confidence=0.9)
+        sig_normed = sig.model_copy(update={"alpha_net": 0.5})
+        merged, _ = deconflict_signals([sig_normed], UNIVERSE)
+
+        assert merged[0].contributions[0].alpha_net == pytest.approx(0.5)
+
+
 class TestEdgeCases:
     def test_empty_signals(self):
         merged, dropped = deconflict_signals([], UNIVERSE)

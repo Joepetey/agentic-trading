@@ -350,7 +350,7 @@ class TestRunStrategies:
         now = datetime(2025, 1, 1, tzinfo=timezone.utc)
         result = run_strategies(
             strategies=[_Mixed()],
-            universe=["X"],  # universe doesn't matter for this strat
+            universe=["WEAK", "STRONG"],
             conn=conn,
             now_ts=now,
         )
@@ -563,7 +563,7 @@ class TestParallelExecution:
                 return [
                     Signal(
                         strategy_id="strong_short",
-                        symbol="X",
+                        symbol="AAPL",
                         side=Side.SHORT,
                         strength=-0.95,
                         confidence=0.9,
@@ -579,7 +579,7 @@ class TestParallelExecution:
             now_ts=now,
             max_workers=2,
         )
-        # -0.95 has higher |strength| than 0.7 → STRONG first
+        # -0.95 has higher |strength| than 0.7 → STRONG_SHORT first
         assert result.signals[0].strategy_id == "strong_short"
 
     def test_default_max_workers_is_sequential(self, conn: sqlite3.Connection) -> None:
@@ -707,6 +707,197 @@ class TestPersistence:
         run_row = conn.execute("SELECT run_id FROM strategy_runs").fetchone()
         sig_row = conn.execute("SELECT run_id FROM signals").fetchone()
         assert sig_row["run_id"] == run_row["run_id"]
+
+
+class TestMetadataStamping:
+    """Tests for signal_id, cycle_id, strategy_version, params_hash stamping."""
+
+    def test_signals_have_unique_signal_ids(self, conn: sqlite3.Connection) -> None:
+        """Each signal gets a unique signal_id from the model default factory."""
+        now = datetime(2025, 1, 1, tzinfo=timezone.utc)
+        result = run_strategies(
+            strategies=[_AlwaysLong()],
+            universe=["AAPL", "MSFT", "GOOG"],
+            conn=conn,
+            now_ts=now,
+        )
+        ids = [s.signal_id for s in result.signals]
+        assert len(ids) == 3
+        assert len(set(ids)) == 3, "Each signal_id must be unique"
+
+    def test_cycle_id_stamped(self, conn: sqlite3.Connection) -> None:
+        """cycle_id parameter propagates to every output signal."""
+        now = datetime(2025, 1, 1, tzinfo=timezone.utc)
+        result = run_strategies(
+            strategies=[_AlwaysLong()],
+            universe=["AAPL"],
+            conn=conn,
+            now_ts=now,
+            cycle_id="test-cycle-123",
+        )
+        assert len(result.signals) == 1
+        assert result.signals[0].cycle_id == "test-cycle-123"
+
+    def test_strategy_version_stamped(self, conn: sqlite3.Connection) -> None:
+        """strategy_version is stamped from Strategy.version."""
+        now = datetime(2025, 1, 1, tzinfo=timezone.utc)
+        result = run_strategies(
+            strategies=[_AlwaysLong()],
+            universe=["AAPL"],
+            conn=conn,
+            now_ts=now,
+        )
+        assert result.signals[0].strategy_version == "1.0.0"
+
+    def test_params_hash_stamped(self, conn: sqlite3.Connection) -> None:
+        """params_hash is stamped from Strategy.params_hash."""
+        strat = _AlwaysLong()
+        now = datetime(2025, 1, 1, tzinfo=timezone.utc)
+        result = run_strategies(
+            strategies=[strat],
+            universe=["AAPL"],
+            conn=conn,
+            now_ts=now,
+        )
+        assert result.signals[0].params_hash == strat.params_hash
+        assert result.signals[0].params_hash != ""
+
+    def test_metadata_stamped_in_parallel(self, conn: sqlite3.Connection) -> None:
+        """Metadata is correctly stamped when running strategies in parallel."""
+        now = datetime(2025, 1, 1, tzinfo=timezone.utc)
+        result = run_strategies(
+            strategies=[_AlwaysLong()],
+            universe=["AAPL", "MSFT"],
+            conn=conn,
+            now_ts=now,
+            max_workers=2,
+            cycle_id="parallel-cycle",
+        )
+        for sig in result.signals:
+            assert sig.cycle_id == "parallel-cycle"
+            assert sig.strategy_version == "1.0.0"
+            assert sig.params_hash != ""
+
+    def test_empty_cycle_id_default(self, conn: sqlite3.Connection) -> None:
+        """cycle_id defaults to empty string when not provided."""
+        now = datetime(2025, 1, 1, tzinfo=timezone.utc)
+        result = run_strategies(
+            strategies=[_AlwaysLong()],
+            universe=["AAPL"],
+            conn=conn,
+            now_ts=now,
+        )
+        assert result.signals[0].cycle_id == ""
+
+    def test_no_signals_no_stamping(self, conn: sqlite3.Connection) -> None:
+        """Strategies that emit no signals don't cause issues with stamping."""
+        now = datetime(2025, 1, 1, tzinfo=timezone.utc)
+        result = run_strategies(
+            strategies=[_AlwaysFlat()],
+            universe=["AAPL"],
+            conn=conn,
+            now_ts=now,
+            cycle_id="some-cycle",
+        )
+        assert len(result.signals) == 0
+
+
+class TestUniverseValidation:
+    """Tests for belt-and-suspenders out-of-universe signal filtering."""
+
+    def test_out_of_universe_signals_dropped(self, conn: sqlite3.Connection) -> None:
+        """Signals for symbols not in the universe are silently dropped."""
+
+        class _OutOfUniverse(Strategy):
+            @property
+            def strategy_id(self) -> str:
+                return "out_of_universe"
+
+            @property
+            def version(self) -> str:
+                return "1.0.0"
+
+            def required_timeframes(self) -> list[str]:
+                return ["1Day"]
+
+            def required_lookback_bars(self) -> int:
+                return 1
+
+            def params(self) -> dict[str, Any]:
+                return {}
+
+            def run(self, ctx: StrategyContext) -> list[Signal]:
+                return [
+                    Signal(
+                        strategy_id=self.strategy_id,
+                        symbol="AAPL",
+                        side=Side.LONG,
+                        strength=0.5,
+                        confidence=0.5,
+                        horizon_bars=5,
+                    ),
+                    Signal(
+                        strategy_id=self.strategy_id,
+                        symbol="ROGUE",  # not in universe
+                        side=Side.LONG,
+                        strength=0.5,
+                        confidence=0.5,
+                        horizon_bars=5,
+                    ),
+                ]
+
+        now = datetime(2025, 1, 1, tzinfo=timezone.utc)
+        result = run_strategies(
+            strategies=[_OutOfUniverse()],
+            universe=["AAPL"],
+            conn=conn,
+            now_ts=now,
+        )
+        assert len(result.signals) == 1
+        assert result.signals[0].symbol == "AAPL"
+
+    def test_all_out_of_universe(self, conn: sqlite3.Connection) -> None:
+        """All signals for out-of-universe symbols → zero signals, no error."""
+
+        class _AllRogue(Strategy):
+            @property
+            def strategy_id(self) -> str:
+                return "all_rogue"
+
+            @property
+            def version(self) -> str:
+                return "1.0.0"
+
+            def required_timeframes(self) -> list[str]:
+                return ["1Day"]
+
+            def required_lookback_bars(self) -> int:
+                return 1
+
+            def params(self) -> dict[str, Any]:
+                return {}
+
+            def run(self, ctx: StrategyContext) -> list[Signal]:
+                return [
+                    Signal(
+                        strategy_id=self.strategy_id,
+                        symbol="ROGUE1",
+                        side=Side.LONG,
+                        strength=0.5,
+                        confidence=0.5,
+                        horizon_bars=5,
+                    ),
+                ]
+
+        now = datetime(2025, 1, 1, tzinfo=timezone.utc)
+        result = run_strategies(
+            strategies=[_AllRogue()],
+            universe=["AAPL"],
+            conn=conn,
+            now_ts=now,
+        )
+        assert len(result.signals) == 0
+        assert len(result.errors) == 0  # not an error, just dropped
 
 
 class TestStrategyRunError:

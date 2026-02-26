@@ -31,6 +31,7 @@ class DropReason(str, Enum):
     BELOW_CONFIDENCE_THRESHOLD = "below_confidence_threshold"
     ZERO_STRENGTH = "zero_strength"
     SYMBOL_EXCLUDED = "symbol_excluded"
+    BELOW_COST_THRESHOLD = "below_cost_threshold"
 
 
 class SizingMethod(str, Enum):
@@ -139,6 +140,7 @@ class SignalContribution(BaseModel):
     confidence: float
     weight: float  # weight used in aggregation
     horizon_bars: int
+    alpha_net: float | None = None  # from normalization step
 
 
 class DroppedSignal(BaseModel):
@@ -169,6 +171,10 @@ class MergedSignal(BaseModel):
         description="Weighted-average confidence, clamped to [0, 1]"
     )
     horizon_bars: int = Field(description="Min horizon across contributors")
+    agg_alpha: float | None = Field(
+        default=None,
+        description="Weighted-average alpha_net from normalization, used for sizing",
+    )
     stop_hint: float | None = None  # tightest stop from any contributor
     tp_hint: float | None = None  # nearest TP from any contributor
     contributions: tuple[SignalContribution, ...] = ()

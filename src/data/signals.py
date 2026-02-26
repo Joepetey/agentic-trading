@@ -43,16 +43,20 @@ def write_signals(
     *,
     run_id: str | None = None,
     eval_ts: datetime,
-    params_hashes: dict[str, str],
+    params_hashes: dict[str, str] | None = None,
 ) -> int:
     """Persist signals to the ``signals`` table.
+
+    Prefers metadata stamped directly on Signal objects (strategy_version,
+    params_hash) over external lookups.  Falls back to ``params_hashes``
+    dict for backward compatibility.
 
     Args:
         conn:          SQLite connection.
         signals:       Signal objects from strategy execution.
         run_id:        Optional strategy_runs.run_id for audit linkage.
         eval_ts:       The evaluation timestamp (now_ts from runner).
-        params_hashes: Mapping of strategy_id → params_hash.
+        params_hashes: Optional mapping of strategy_id → params_hash (fallback).
 
     Returns:
         Number of rows written.
@@ -60,6 +64,7 @@ def write_signals(
     if not signals:
         return 0
 
+    params_hashes = params_hashes or {}
     ts_str = _normalise_ts(eval_ts)
     rows: list[tuple[Any, ...]] = []
     for sig in signals:
@@ -70,12 +75,16 @@ def write_signals(
         )
         tags_json = json.dumps(list(sig.tags)) if sig.tags else None
 
+        # Prefer Signal-level metadata, fall back to external lookups
+        version = sig.strategy_version or "unknown"
+        phash = sig.params_hash or params_hashes.get(sig.strategy_id, "")
+
         rows.append((
             ts_str,
             sig.symbol,
             sig.strategy_id,
-            "unknown",  # placeholder — overridden below
-            params_hashes.get(sig.strategy_id, ""),
+            version,
+            phash,
             sig.side.value,
             sig.strength,
             sig.confidence,
@@ -113,14 +122,19 @@ def write_signals_from_result(
     eval_ts: datetime,
     strategies: list[Any],
 ) -> int:
-    """Convenience wrapper that builds params_hashes + version from strategy objects.
+    """Convenience wrapper — builds fallback lookups from strategy objects.
+
+    Since the runner now stamps ``strategy_version`` and ``params_hash``
+    directly on each Signal, this primarily delegates to :func:`write_signals`.
+    The strategy objects serve as a fallback for signals that weren't
+    processed by the runner (e.g. manual / test signals).
 
     Args:
         conn:       SQLite connection.
         signals:    Signal objects from strategy execution.
         run_id:     Optional strategy_runs.run_id.
         eval_ts:    The evaluation timestamp.
-        strategies: Strategy instances that were run (for version + hash lookup).
+        strategies: Strategy instances (fallback for version + hash).
 
     Returns:
         Number of rows written.
@@ -128,53 +142,26 @@ def write_signals_from_result(
     if not signals:
         return 0
 
-    # Build lookups from strategy objects.
+    # Build fallback lookups from strategy objects.
     version_map: dict[str, str] = {s.strategy_id: s.version for s in strategies}
     hash_map: dict[str, str] = {s.strategy_id: s.params_hash for s in strategies}
 
-    ts_str = _normalise_ts(eval_ts)
-    rows: list[tuple[Any, ...]] = []
+    # Enrich signals that are missing metadata (e.g. not run through the runner).
+    enriched: list[Signal] = []
     for sig in signals:
-        invalidate_json = (
-            json.dumps([ic.model_dump() for ic in sig.invalidate])
-            if sig.invalidate
-            else None
-        )
-        tags_json = json.dumps(list(sig.tags)) if sig.tags else None
+        update: dict[str, str] = {}
+        if not sig.strategy_version:
+            update["strategy_version"] = version_map.get(sig.strategy_id, "")
+        if not sig.params_hash:
+            update["params_hash"] = hash_map.get(sig.strategy_id, "")
+        enriched.append(sig.model_copy(update=update) if update else sig)
 
-        rows.append((
-            ts_str,
-            sig.symbol,
-            sig.strategy_id,
-            version_map.get(sig.strategy_id, "unknown"),
-            hash_map.get(sig.strategy_id, ""),
-            sig.side.value,
-            sig.strength,
-            sig.confidence,
-            sig.horizon_bars,
-            sig.entry.value,
-            sig.entry_price_hint,
-            sig.stop_price,
-            sig.take_profit_price,
-            sig.time_stop_bars,
-            invalidate_json,
-            tags_json,
-            sig.explain,
-            run_id,
-        ))
-
-    before = conn.total_changes
-    conn.executemany(_INSERT_SIGNAL_SQL, rows)
-    written = conn.total_changes - before
-    conn.commit()
-
-    logger.info(
-        "signals_written",
-        count=written,
-        total=len(signals),
+    return write_signals(
+        conn,
+        enriched,
         run_id=run_id,
+        eval_ts=eval_ts,
     )
-    return written
 
 
 # ── Run lifecycle ────────────────────────────────────────────────────
