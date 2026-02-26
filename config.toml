@@ -28,10 +28,14 @@ max_position_pct = 0.05
 max_portfolio_exposure_pct = 0.90
 max_daily_loss_pct = 0.02
 max_open_orders = 10
+long_only = false
+# max_names = 10  # uncomment to limit portfolio breadth
 
 [orchestrator]
 primary_timeframe = "1Day"
 max_stale_pct = 0.50
+vol_lookback_bars = 20
+default_vol_annual = 0.30
 
 [orchestrator.max_staleness]
 "1Day" = 2880
@@ -44,6 +48,18 @@ max_stale_pct = 0.50
 [orchestrator.edge_scales]
 # Per-strategy calibration, default 1.0
 # tqqq_weekly = 1.2
+
+[orchestrator.strategy_categories]
+# Maps strategy_id to category for regime weighting
+# sma_crossover = "trend"
+# mean_reversion = "mean_rev"
+# momentum = "trend"
+
+[orchestrator.regime_weights]
+# Per-regime category weight multipliers
+# Example: [orchestrator.regime_weights.trend]
+# trend = 2.0
+# mean_rev = 0.5
 
 [strategies]
 enabled = ["sma_crossover", "mean_reversion", "momentum", "tqqq_weekly"]

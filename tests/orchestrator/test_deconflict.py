@@ -18,6 +18,7 @@ def _sig(
     horizon_bars: int = 5,
     stop_price: float | None = None,
     take_profit_price: float | None = None,
+    tags: tuple[str, ...] = (),
 ) -> Signal:
     return Signal(
         strategy_id=strategy_id,
@@ -28,6 +29,7 @@ def _sig(
         horizon_bars=horizon_bars,
         stop_price=stop_price,
         take_profit_price=take_profit_price,
+        tags=tags,
     )
 
 
@@ -313,6 +315,253 @@ class TestAlphaNet:
         merged, _ = deconflict_signals([sig_normed], UNIVERSE)
 
         assert merged[0].contributions[0].alpha_net == pytest.approx(0.5)
+
+
+class TestVeto:
+    """Tests for veto tag handling."""
+
+    def test_veto_tag_drops_all_signals(self):
+        """Signal with do_not_trade tag drops all signals for that symbol."""
+        s_veto = _sig(
+            strategy_id="risk_tool", side=Side.FLAT, strength=-0.5,
+            confidence=1.0, tags=("do_not_trade",),
+        )
+        s_long = _sig(strategy_id="strat_a", strength=0.8)
+        merged, dropped = deconflict_signals([s_veto, s_long], UNIVERSE)
+
+        assert len(merged) == 0
+        assert len(dropped) == 2
+        assert all(d.reason == DropReason.VETOED for d in dropped)
+
+    def test_veto_only_affects_vetoed_symbol(self):
+        """Veto on AAPL does not affect MSFT."""
+        s_veto = _sig(
+            strategy_id="risk_tool", symbol="AAPL", side=Side.FLAT,
+            strength=-0.5, confidence=1.0, tags=("do_not_trade",),
+        )
+        s_aapl = _sig(strategy_id="strat_a", symbol="AAPL", strength=0.8)
+        s_msft = _sig(strategy_id="strat_a", symbol="MSFT", strength=0.6)
+        merged, dropped = deconflict_signals([s_veto, s_aapl, s_msft], UNIVERSE)
+
+        assert len(merged) == 1
+        assert merged[0].symbol == "MSFT"
+        vetoed = [d for d in dropped if d.reason == DropReason.VETOED]
+        assert len(vetoed) == 2
+        assert all(d.symbol == "AAPL" for d in vetoed)
+
+    def test_veto_with_multiple_strategies(self):
+        """Veto drops the veto signal itself and all other strategies' signals."""
+        s_veto = _sig(
+            strategy_id="risk_tool", side=Side.FLAT, strength=-0.3,
+            confidence=1.0, tags=("do_not_trade",),
+        )
+        s_a = _sig(strategy_id="strat_a", strength=0.8)
+        s_b = _sig(strategy_id="strat_b", strength=0.6)
+        merged, dropped = deconflict_signals([s_veto, s_a, s_b], UNIVERSE)
+
+        assert len(merged) == 0
+        assert len(dropped) == 3
+        strategy_ids = {d.strategy_id for d in dropped}
+        assert strategy_ids == {"risk_tool", "strat_a", "strat_b"}
+
+    def test_custom_veto_tag(self):
+        """Custom veto_tags parameter works."""
+        s_halt = _sig(
+            strategy_id="risk_tool", strength=0.5, tags=("halt_trading",),
+        )
+        s_long = _sig(strategy_id="strat_a", strength=0.8)
+        # Default veto_tags doesn't include "halt_trading" → no veto
+        merged, dropped = deconflict_signals([s_halt, s_long], UNIVERSE)
+        assert len(merged) == 1
+
+        # With custom veto_tags → veto triggers
+        merged, dropped = deconflict_signals(
+            [s_halt, s_long], UNIVERSE,
+            veto_tags=("halt_trading",),
+        )
+        assert len(merged) == 0
+        assert all(d.reason == DropReason.VETOED for d in dropped)
+
+    def test_no_veto_when_tag_absent(self):
+        """Normal signals without veto tags are unaffected."""
+        s1 = _sig(strategy_id="strat_a", tags=("momentum",))
+        merged, dropped = deconflict_signals([s1], UNIVERSE)
+        assert len(merged) == 1
+        assert len(dropped) == 0
+
+
+class TestRegimePrecedence:
+    """Tests for regime-based weight multipliers."""
+
+    def test_regime_tips_consensus(self):
+        """In trend regime, trend-category strategy gets 2x, tipping consensus."""
+        s_long = _sig(strategy_id="trend_strat", side=Side.LONG, strength=0.5, confidence=0.8)
+        s_short = _sig(strategy_id="mr_strat", side=Side.SHORT, strength=0.5, confidence=0.8)
+
+        # Without regime, these cancel
+        merged, _ = deconflict_signals([s_long, s_short], UNIVERSE)
+        assert len(merged) == 0
+
+        # With trend regime, trend gets 2x → LONG wins
+        merged, dropped = deconflict_signals(
+            [s_long, s_short], UNIVERSE,
+            regime="trend",
+            regime_weights={"trend": {"trend": 2.0, "mean_rev": 0.5}},
+            strategy_categories={"trend_strat": "trend", "mr_strat": "mean_rev"},
+        )
+        assert len(merged) == 1
+        assert merged[0].side == "long"
+
+    def test_regime_by_category(self):
+        """Category-based regime weight lookup works."""
+        s1 = _sig(strategy_id="strat_a", strength=0.5, confidence=0.8)
+        s2 = _sig(strategy_id="strat_b", side=Side.SHORT, strength=0.5, confidence=0.8)
+
+        merged, _ = deconflict_signals(
+            [s1, s2], UNIVERSE,
+            regime="chop",
+            regime_weights={"chop": {"mean_rev": 2.0}},
+            strategy_categories={"strat_b": "mean_rev"},
+        )
+        # strat_b (mean_rev) gets 2x in chop → SHORT wins
+        assert len(merged) == 1
+        assert merged[0].side == "short"
+
+    def test_regime_by_strategy_id(self):
+        """strategy_id takes precedence over category in regime_weights."""
+        s1 = _sig(strategy_id="strat_a", strength=0.5, confidence=0.8)
+        s2 = _sig(strategy_id="strat_b", side=Side.SHORT, strength=0.5, confidence=0.8)
+
+        merged, _ = deconflict_signals(
+            [s1, s2], UNIVERSE,
+            regime="trend",
+            # strat_a has both category and direct ID match — ID takes precedence
+            regime_weights={"trend": {"strat_a": 3.0, "trend": 0.5}},
+            strategy_categories={"strat_a": "trend"},
+        )
+        # strat_a gets 3.0 (by ID, not 0.5 by category) → LONG wins
+        assert len(merged) == 1
+        assert merged[0].side == "long"
+
+    def test_no_regime_no_effect(self):
+        """regime=None leaves behavior unchanged."""
+        s1 = _sig(strategy_id="strat_a", strength=0.5, confidence=0.8)
+        s2 = _sig(strategy_id="strat_b", side=Side.SHORT, strength=0.5, confidence=0.8)
+
+        # With regime_weights defined but regime=None → no effect
+        merged, _ = deconflict_signals(
+            [s1, s2], UNIVERSE,
+            regime=None,
+            regime_weights={"trend": {"strat_a": 10.0}},
+            strategy_categories={"strat_a": "trend"},
+        )
+        assert len(merged) == 0  # still cancels
+
+
+class TestAlphaThreshold:
+    """Tests for post-merge alpha threshold filtering."""
+
+    def test_below_threshold_dropped(self):
+        """Weak merged signals are filtered out."""
+        sig = _sig(strength=0.5, confidence=0.8)
+        sig_normed = sig.model_copy(update={"alpha_net": 0.01})
+        merged, dropped = deconflict_signals(
+            [sig_normed], UNIVERSE,
+            min_symbol_alpha=0.05,
+        )
+
+        assert len(merged) == 0
+        assert len(dropped) == 1
+        assert dropped[0].reason == DropReason.BELOW_ALPHA_THRESHOLD
+        assert "0.0100" in dropped[0].detail
+
+    def test_above_threshold_kept(self):
+        """Strong signals pass through."""
+        sig = _sig(strength=0.8, confidence=0.9)
+        sig_normed = sig.model_copy(update={"alpha_net": 0.5})
+        merged, dropped = deconflict_signals(
+            [sig_normed], UNIVERSE,
+            min_symbol_alpha=0.05,
+        )
+
+        assert len(merged) == 1
+        assert merged[0].agg_alpha == pytest.approx(0.5)
+
+    def test_zero_threshold_keeps_all(self):
+        """min_symbol_alpha=0.0 (default) means no filtering."""
+        sig = _sig(strength=0.1, confidence=0.1)
+        sig_normed = sig.model_copy(update={"alpha_net": 0.001})
+        merged, dropped = deconflict_signals([sig_normed], UNIVERSE)
+
+        assert len(merged) == 1
+
+    def test_threshold_only_filters_alpha_signals(self):
+        """Non-normalized signals (agg_alpha=None) are not filtered by threshold."""
+        sig = _sig(strength=0.1, confidence=0.1)
+        merged, dropped = deconflict_signals(
+            [sig], UNIVERSE,
+            min_symbol_alpha=0.5,
+        )
+
+        # agg_alpha is None → threshold check skipped
+        assert len(merged) == 1
+
+
+class TestAggAlphaSum:
+    """Tests for agg_alpha = sum of alpha_net (not weighted average)."""
+
+    def test_agg_alpha_is_sum(self):
+        """agg_alpha is the sum of alpha_net values for multi-signal merge."""
+        s1 = _sig(strategy_id="strat_a", strength=0.8, confidence=0.9)
+        s2 = _sig(strategy_id="strat_b", strength=0.6, confidence=0.7)
+        s1_normed = s1.model_copy(update={"alpha_net": 0.3})
+        s2_normed = s2.model_copy(update={"alpha_net": 0.2})
+
+        merged, _ = deconflict_signals([s1_normed, s2_normed], UNIVERSE)
+
+        assert len(merged) == 1
+        # Sum, not average: 0.3 + 0.2 = 0.5, not (0.3 + 0.2) / 2 = 0.25
+        assert merged[0].agg_alpha == pytest.approx(0.5)
+
+    def test_agg_alpha_sum_three_signals(self):
+        """Three same-side signals: agg_alpha = sum of all alpha_net."""
+        s1 = _sig(strategy_id="strat_a", strength=0.8, confidence=0.9)
+        s2 = _sig(strategy_id="strat_b", strength=0.6, confidence=0.7)
+        s3 = _sig(strategy_id="strat_c", strength=0.5, confidence=0.8)
+        s1_n = s1.model_copy(update={"alpha_net": 0.4})
+        s2_n = s2.model_copy(update={"alpha_net": 0.3})
+        s3_n = s3.model_copy(update={"alpha_net": 0.2})
+
+        merged, _ = deconflict_signals([s1_n, s2_n, s3_n], UNIVERSE)
+
+        assert len(merged) == 1
+        assert merged[0].agg_alpha == pytest.approx(0.9)
+
+
+class TestWeightedAvgHorizon:
+    """Tests for horizon_bars = weighted average (not min)."""
+
+    def test_weighted_avg_horizon(self):
+        """Horizon is weighted average of contributors."""
+        # strat_a: strength=0.8, conf=0.9 → weight ≈ 0.72
+        # strat_b: strength=0.4, conf=0.5 → weight ≈ 0.20
+        s1 = _sig(strategy_id="strat_a", strength=0.8, confidence=0.9, horizon_bars=20)
+        s2 = _sig(strategy_id="strat_b", strength=0.4, confidence=0.5, horizon_bars=5)
+        merged, _ = deconflict_signals([s1, s2], UNIVERSE)
+
+        assert len(merged) == 1
+        # Weighted avg: (20*0.72 + 5*0.20) / (0.72+0.20) ≈ 16.7 → 17
+        # (Not min=5)
+        assert merged[0].horizon_bars > 5
+        assert merged[0].horizon_bars <= 20
+
+    def test_same_horizon_unchanged(self):
+        """When all signals have the same horizon, result is that value."""
+        s1 = _sig(strategy_id="strat_a", horizon_bars=10)
+        s2 = _sig(strategy_id="strat_b", horizon_bars=10)
+        merged, _ = deconflict_signals([s1, s2], UNIVERSE)
+
+        assert merged[0].horizon_bars == 10
 
 
 class TestEdgeCases:

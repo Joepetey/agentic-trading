@@ -20,15 +20,20 @@ def compute_targets(
     portfolio: PortfolioState,
     risk_limits: RiskLimits,
     method: SizingMethod = SizingMethod.SIGNAL_WEIGHTED,
+    *,
+    vol_map: dict[str, float] | None = None,
+    default_vol: float = 0.30,
 ) -> list[TargetPosition]:
     """Convert merged signals into target positions with risk-aware sizing.
 
     Flow:
-    1. Compute raw allocation per signal based on sizing method.
-    2. Cap each position to max_position_pct of equity.
-    3. Scale all positions down if total exceeds max_portfolio_exposure_pct.
-    4. Add FLAT targets for symbols with exit signals (target_notional=0).
-    5. Existing positions not referenced by any signal remain unchanged
+    1. Apply long-only filter (drop short-side directional signals).
+    2. Apply max-names filter (keep top N by alpha magnitude).
+    3. Compute raw allocation per signal based on sizing method.
+    4. Cap each position to max_position_pct of equity.
+    5. Scale all positions down if total exceeds max_portfolio_exposure_pct.
+    6. Add FLAT targets for symbols with exit signals (target_notional=0).
+    7. Existing positions not referenced by any signal remain unchanged
        (no target emitted — Phase 4 interprets missing target as "hold").
 
     Args:
@@ -36,6 +41,8 @@ def compute_targets(
         portfolio:       Current portfolio state.
         risk_limits:     Risk configuration.
         method:          Sizing algorithm.
+        vol_map:         Per-symbol annualized vol estimates (for VOL_TARGET).
+        default_vol:     Fallback vol when symbol not in vol_map.
 
     Returns:
         List of TargetPosition, one per symbol with a signal.
@@ -55,13 +62,48 @@ def compute_targets(
     directional = [m for m in merged_signals if m.side != "flat"]
     exits = [m for m in merged_signals if m.side == "flat"]
 
-    # Compute directional targets
+    # ── Pre-sizing filters ────────────────────────────────────────
+
+    # Long-only: drop short-side directional signals
+    if risk_limits.long_only:
+        shorts = [m for m in directional if m.side == "short"]
+        if shorts:
+            logger.info(
+                "long_only_drop_shorts",
+                dropped=[m.symbol for m in shorts],
+            )
+        directional = [m for m in directional if m.side != "short"]
+
+    # Max names: keep top N by alpha magnitude
+    if risk_limits.max_names is not None and len(directional) > risk_limits.max_names:
+        directional.sort(
+            key=lambda m: (
+                abs(m.agg_alpha) if m.agg_alpha is not None
+                else abs(m.agg_strength) * m.agg_confidence
+            ),
+            reverse=True,
+        )
+        dropped_names = [m.symbol for m in directional[risk_limits.max_names:]]
+        directional = directional[:risk_limits.max_names]
+        logger.info(
+            "max_names_filter",
+            max_names=risk_limits.max_names,
+            dropped=dropped_names,
+        )
+
+    # ── Compute directional targets ───────────────────────────────
+
     targets: list[TargetPosition] = []
 
     if method == SizingMethod.EQUAL_WEIGHT:
         targets.extend(_size_equal_weight(directional, equity, max_notional, max_per_position))
     elif method == SizingMethod.SIGNAL_WEIGHTED:
         targets.extend(_size_signal_weighted(directional, equity, max_notional, max_per_position))
+    elif method == SizingMethod.VOL_TARGET:
+        targets.extend(_size_vol_target(
+            directional, equity, max_notional, max_per_position,
+            vol_map or {}, default_vol,
+        ))
 
     # Add exit targets (notional=0 means "close the position")
     for m in exits:
@@ -126,6 +168,58 @@ def _size_signal_weighted(
         else abs(m.agg_strength) * m.agg_confidence
         for m in signals
     ]
+
+    return _allocate_and_cap(signals, raw_weights, equity, max_total, max_per_position)
+
+
+def _size_vol_target(
+    signals: list[MergedSignal],
+    equity: float,
+    max_total: float,
+    max_per_position: float,
+    vol_map: dict[str, float],
+    default_vol: float,
+) -> list[TargetPosition]:
+    """Volatility-target sizing: risk_weight ∝ |alpha| / vol.
+
+    Higher alpha per unit of vol → bigger allocation.
+    Lower vol → bigger allocation for same alpha.
+
+    Steps:
+    1. risk_weight = alpha / vol for each signal.
+    2. Normalize so weights sum to 1.
+    3. Allocate: notional = weight * max_total.
+    4. Cap each at max_per_position; redistribute excess equally.
+    """
+    if not signals:
+        return []
+
+    raw_weights: list[float] = []
+    for m in signals:
+        alpha = (
+            abs(m.agg_alpha) if m.agg_alpha is not None
+            else abs(m.agg_strength) * m.agg_confidence
+        )
+        vol = vol_map.get(m.symbol, default_vol)
+        raw_weights.append(alpha / vol)
+
+    return _allocate_and_cap(
+        signals, raw_weights, equity, max_total, max_per_position,
+        vol_map=vol_map, default_vol=default_vol,
+    )
+
+
+def _allocate_and_cap(
+    signals: list[MergedSignal],
+    raw_weights: list[float],
+    equity: float,
+    max_total: float,
+    max_per_position: float,
+    *,
+    vol_map: dict[str, float] | None = None,
+    default_vol: float = 0.30,
+) -> list[TargetPosition]:
+    """Normalize weights, allocate notionals, cap and redistribute excess."""
     total_raw = sum(raw_weights)
 
     if total_raw < 1e-12:
@@ -152,17 +246,35 @@ def _size_signal_weighted(
             if n < max_per_position:
                 notionals[i] = min(n + bonus, max_per_position)
 
-    return [_build_target(signals[i], notionals[i], equity) for i in range(len(signals))]
+    return [
+        _build_target(signals[i], notionals[i], equity, vol_map=vol_map, default_vol=default_vol)
+        for i in range(len(signals))
+    ]
 
 
 def _build_target(
     merged: MergedSignal,
     notional: float,
     equity: float,
+    *,
+    vol_map: dict[str, float] | None = None,
+    default_vol: float = 0.30,
 ) -> TargetPosition:
     """Construct a TargetPosition from a MergedSignal and computed notional."""
     # Sign the notional: negative for short
     signed_notional = notional if merged.side == "long" else -notional
+
+    explain_parts = [
+        f"side={merged.side}",
+        f"agg_strength={merged.agg_strength:.3f}",
+        f"agg_confidence={merged.agg_confidence:.3f}",
+        f"notional=${abs(signed_notional):,.2f}",
+        f"({abs(signed_notional / equity) * 100:.1f}% of equity)",
+    ]
+
+    if vol_map is not None:
+        vol = vol_map.get(merged.symbol, default_vol)
+        explain_parts.append(f"vol={vol:.3f}")
 
     return TargetPosition(
         symbol=merged.symbol,
@@ -173,11 +285,5 @@ def _build_target(
         stop_hint=merged.stop_hint,
         tp_hint=merged.tp_hint,
         provenance=merged.contributions,
-        explain=(
-            f"side={merged.side}, "
-            f"agg_strength={merged.agg_strength:.3f}, "
-            f"agg_confidence={merged.agg_confidence:.3f}, "
-            f"notional=${abs(signed_notional):,.2f} "
-            f"({abs(signed_notional / equity) * 100:.1f}% of equity)"
-        ),
+        explain=", ".join(explain_parts),
     )

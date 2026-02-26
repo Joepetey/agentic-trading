@@ -51,6 +51,7 @@ def orchestrate(
     max_workers: int = 1,
     strategy_timeout_secs: float | None = 30.0,
     persist: bool = False,
+    regime: str | None = None,
 ) -> PortfolioIntent:
     """Execute one full decision cycle.
 
@@ -81,6 +82,8 @@ def orchestrate(
         max_workers:        Thread-pool size for strategy execution.
         strategy_timeout_secs: Per-strategy timeout.
         persist:            If True, persist intent + strategy run to SQLite.
+        regime:             Current market regime (e.g., "trend", "chop") for
+                            regime-weighted deconfliction.
 
     Returns:
         PortfolioIntent — the complete decision plan.
@@ -224,6 +227,11 @@ def orchestrate(
     merged_signals, dropped_signals = deconflict_signals(
         signals=normalized_signals,
         universe=universe_result.included,
+        regime=regime,
+        regime_weights=orch_cfg.regime_weights,
+        strategy_categories=orch_cfg.strategy_categories,
+        veto_tags=orch_cfg.veto_tags,
+        min_symbol_alpha=orch_cfg.min_symbol_alpha,
     )
     orch_log.info(
         "signals_deconflicted",
@@ -231,12 +239,31 @@ def orchestrate(
         dropped=len(dropped_signals),
     )
 
+    # ── Step 3.5: Estimate volatilities for sizing ──────────────────
+    vol_map: dict[str, float] = {}
+    if sizing_method == SizingMethod.VOL_TARGET:
+        from src.orchestrator.volatility import estimate_volatilities
+        vol_map = estimate_volatilities(
+            conn=conn,
+            symbols=[m.symbol for m in merged_signals if m.side != "flat"],
+            eval_ts=eval_ts,
+            timeframe=orch_cfg.primary_timeframe,
+            lookback_bars=orch_cfg.vol_lookback_bars,
+            default_vol=orch_cfg.default_vol_annual,
+        )
+        orch_log.info(
+            "volatilities_estimated",
+            symbol_count=len(vol_map),
+        )
+
     # ── Step 4: Position sizing ──────────────────────────────────────
     targets = compute_targets(
         merged_signals=merged_signals,
         portfolio=portfolio,
         risk_limits=risk_limits,
         method=sizing_method,
+        vol_map=vol_map,
+        default_vol=orch_cfg.default_vol_annual,
     )
     orch_log.info(
         "targets_computed",

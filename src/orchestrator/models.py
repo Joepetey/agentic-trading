@@ -32,6 +32,8 @@ class DropReason(str, Enum):
     ZERO_STRENGTH = "zero_strength"
     SYMBOL_EXCLUDED = "symbol_excluded"
     BELOW_COST_THRESHOLD = "below_cost_threshold"
+    VETOED = "vetoed"
+    BELOW_ALPHA_THRESHOLD = "below_alpha_threshold"
 
 
 class SizingMethod(str, Enum):
@@ -39,6 +41,7 @@ class SizingMethod(str, Enum):
 
     EQUAL_WEIGHT = "equal_weight"
     SIGNAL_WEIGHTED = "signal_weighted"
+    VOL_TARGET = "vol_target"
 
 
 # ── Portfolio State (input) ──────────────────────────────────────────
@@ -170,10 +173,10 @@ class MergedSignal(BaseModel):
     agg_confidence: float = Field(
         description="Weighted-average confidence, clamped to [0, 1]"
     )
-    horizon_bars: int = Field(description="Min horizon across contributors")
+    horizon_bars: int = Field(description="Weighted-average horizon across contributors")
     agg_alpha: float | None = Field(
         default=None,
-        description="Weighted-average alpha_net from normalization, used for sizing",
+        description="Sum of alpha_net across contributors, used for sizing and threshold filtering",
     )
     stop_hint: float | None = None  # tightest stop from any contributor
     tp_hint: float | None = None  # nearest TP from any contributor

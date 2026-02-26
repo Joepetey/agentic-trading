@@ -28,6 +28,7 @@ from src.orchestrator.orchestrate import orchestrate
 from src.orchestrator.sizing import compute_targets
 from src.orchestrator.timestamp import EvalTimestampResult, resolve_eval_ts
 from src.orchestrator.universe import filter_universe
+from src.orchestrator.volatility import estimate_volatilities
 
 __all__ = [
     # Main entry point
@@ -39,6 +40,7 @@ __all__ = [
     "normalize_signals",
     "deconflict_signals",
     "compute_targets",
+    "estimate_volatilities",
     # Models
     "DroppedSignal",
     "DropReason",

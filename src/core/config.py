@@ -64,6 +64,14 @@ class RiskLimits(BaseModel):
     max_open_orders: int = Field(
         default=10, description="Max concurrent open orders"
     )
+    long_only: bool = Field(
+        default=False,
+        description="If True, drop short-side signals during sizing (long-only portfolio)",
+    )
+    max_names: int | None = Field(
+        default=None,
+        description="Max number of positions to size; keep top N by alpha magnitude",
+    )
 
 
 class OrchestratorConfig(BaseModel):
@@ -88,6 +96,30 @@ class OrchestratorConfig(BaseModel):
     edge_scales: dict[str, float] = Field(
         default_factory=dict,
         description="Per-strategy edge calibration scale (default 1.0, updated from backtests)",
+    )
+    strategy_categories: dict[str, str] = Field(
+        default_factory=dict,
+        description="Maps strategy_id to category (e.g., 'trend', 'mean_rev') for regime weighting",
+    )
+    regime_weights: dict[str, dict[str, float]] = Field(
+        default_factory=dict,
+        description="Maps regime -> category -> weight multiplier (e.g., {'trend': {'trend': 2.0}})",
+    )
+    veto_tags: tuple[str, ...] = Field(
+        default=("do_not_trade",),
+        description="Signal tags that trigger per-symbol veto (drop all signals for that symbol)",
+    )
+    min_symbol_alpha: float = Field(
+        default=0.0,
+        description="Post-merge filter: discard symbol if abs(agg_alpha) < this threshold",
+    )
+    vol_lookback_bars: int = Field(
+        default=20,
+        description="Number of bars for realized vol estimation",
+    )
+    default_vol_annual: float = Field(
+        default=0.30,
+        description="Fallback annualized vol when insufficient bar data (30%)",
     )
 
 
