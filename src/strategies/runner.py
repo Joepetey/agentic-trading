@@ -97,6 +97,7 @@ def run_strategies(
     *,
     max_workers: int = 1,
     strategy_timeout_secs: float | None = _DEFAULT_TIMEOUT_SECS,
+    persist: bool = False,
 ) -> RunResult:
     """Run every strategy against the universe, collecting signals and errors.
 
@@ -122,6 +123,9 @@ def run_strategies(
             Per-strategy time budget in seconds.  ``None`` → no limit.
             A strategy that exceeds its budget is recorded as a
             ``StrategyRunError`` with ``error_type="TimeoutError"``.
+        persist:
+            If ``True``, write signals and a strategy_runs record to
+            SQLite after execution completes.
 
     Returns:
         RunResult with signals sorted by descending |strength|.
@@ -130,12 +134,25 @@ def run_strategies(
     constraints = constraints or Constraints()
     universe_tuple = tuple(universe)
 
+    # ── Optional: create run record ─────────────────────────────────
+    run_id: str | None = None
+    if persist:
+        from src.data.signals import create_run
+
+        run_id = create_run(
+            conn,
+            eval_ts=now_ts,
+            strategies=[s.strategy_id for s in strategies],
+            universe_size=len(universe),
+        )
+
     run_log = logger.bind(
         runner="run_strategies",
         strategy_count=len(strategies),
         symbol_count=len(universe),
         as_of=now_ts.isoformat(),
         max_workers=max_workers,
+        run_id=run_id,
     )
     run_log.info("run_start")
 
@@ -182,6 +199,36 @@ def run_strategies(
         elapsed_ms=round(elapsed_ms, 2),
         strategies_run=len(strategies),
     )
+
+    # ── Phase 4: persist (optional) ─────────────────────────────────
+    if persist:
+        from src.data.signals import complete_run, write_signals_from_result
+
+        try:
+            written = write_signals_from_result(
+                conn,
+                signals,
+                run_id=run_id,
+                eval_ts=now_ts,
+                strategies=strategies,
+            )
+            complete_run(
+                conn,
+                run_id,  # type: ignore[arg-type]
+                signals_written=written,
+                errors=len(errors),
+                elapsed_ms=result.elapsed_ms,
+            )
+        except Exception as exc:
+            run_log.error("persist_failed", error=str(exc))
+            complete_run(
+                conn,
+                run_id,  # type: ignore[arg-type]
+                signals_written=0,
+                errors=len(errors),
+                elapsed_ms=result.elapsed_ms,
+                error=str(exc),
+            )
 
     run_log.info(
         "run_complete",

@@ -600,6 +600,115 @@ class TestParallelExecution:
         assert "ThreadPoolExecutor" not in r.thread_name
 
 
+class TestPersistence:
+    """Tests for persist=True signal and run record writing."""
+
+    @staticmethod
+    def _ensure_symbols(conn: sqlite3.Connection, symbols: list[str]) -> None:
+        for s in symbols:
+            conn.execute("INSERT OR IGNORE INTO symbols (symbol) VALUES (?)", (s,))
+        conn.commit()
+
+    def test_persist_writes_signals(self, conn: sqlite3.Connection) -> None:
+        """persist=True writes signals to the signals table."""
+        self._ensure_symbols(conn, ["AAPL", "MSFT"])
+        now = datetime(2025, 1, 1, tzinfo=timezone.utc)
+        result = run_strategies(
+            strategies=[_AlwaysLong()],
+            universe=["AAPL", "MSFT"],
+            conn=conn,
+            now_ts=now,
+            persist=True,
+        )
+        assert len(result.signals) == 2
+
+        rows = conn.execute(
+            "SELECT * FROM signals WHERE strategy_id = 'always_long' ORDER BY symbol",
+        ).fetchall()
+        assert len(rows) == 2
+        assert rows[0]["symbol"] == "AAPL"
+        assert rows[1]["symbol"] == "MSFT"
+        assert rows[0]["side"] == "long"
+        assert rows[0]["strength"] == 0.7
+
+    def test_persist_creates_run_record(self, conn: sqlite3.Connection) -> None:
+        """persist=True creates a strategy_runs record."""
+        self._ensure_symbols(conn, ["AAPL"])
+        now = datetime(2025, 1, 1, tzinfo=timezone.utc)
+        run_strategies(
+            strategies=[_AlwaysLong()],
+            universe=["AAPL"],
+            conn=conn,
+            now_ts=now,
+            persist=True,
+        )
+        row = conn.execute("SELECT * FROM strategy_runs").fetchone()
+        assert row is not None
+        assert row["status"] == "done"
+        assert row["signals_written"] == 1
+        assert row["errors"] == 0
+        assert row["eval_ts"] == now.isoformat()
+        assert row["strategies"] == "always_long"
+
+    def test_persist_false_no_writes(self, conn: sqlite3.Connection) -> None:
+        """Default persist=False writes nothing to DB."""
+        now = datetime(2025, 1, 1, tzinfo=timezone.utc)
+        run_strategies(
+            strategies=[_AlwaysLong()],
+            universe=["AAPL"],
+            conn=conn,
+            now_ts=now,
+        )
+        assert conn.execute("SELECT COUNT(*) FROM signals").fetchone()[0] == 0
+        assert conn.execute("SELECT COUNT(*) FROM strategy_runs").fetchone()[0] == 0
+
+    def test_persist_with_errors(self, conn: sqlite3.Connection) -> None:
+        """persist=True records error count in the run record."""
+        self._ensure_symbols(conn, ["AAPL"])
+        now = datetime(2025, 1, 1, tzinfo=timezone.utc)
+        run_strategies(
+            strategies=[_Exploding(), _AlwaysLong()],
+            universe=["AAPL"],
+            conn=conn,
+            now_ts=now,
+            persist=True,
+        )
+        row = conn.execute("SELECT * FROM strategy_runs").fetchone()
+        assert row["errors"] == 1
+        assert row["signals_written"] == 1  # AlwaysLong's signal
+
+    def test_persist_stores_version_and_hash(self, conn: sqlite3.Connection) -> None:
+        """Persisted signals include strategy_version and params_hash."""
+        self._ensure_symbols(conn, ["AAPL"])
+        now = datetime(2025, 1, 1, tzinfo=timezone.utc)
+        strat = _AlwaysLong()
+        run_strategies(
+            strategies=[strat],
+            universe=["AAPL"],
+            conn=conn,
+            now_ts=now,
+            persist=True,
+        )
+        row = conn.execute("SELECT * FROM signals").fetchone()
+        assert row["strategy_version"] == "1.0.0"
+        assert row["params_hash"] == strat.params_hash
+
+    def test_persist_run_id_links_signals(self, conn: sqlite3.Connection) -> None:
+        """Signals reference the correct run_id."""
+        self._ensure_symbols(conn, ["AAPL"])
+        now = datetime(2025, 1, 1, tzinfo=timezone.utc)
+        run_strategies(
+            strategies=[_AlwaysLong()],
+            universe=["AAPL"],
+            conn=conn,
+            now_ts=now,
+            persist=True,
+        )
+        run_row = conn.execute("SELECT run_id FROM strategy_runs").fetchone()
+        sig_row = conn.execute("SELECT run_id FROM signals").fetchone()
+        assert sig_row["run_id"] == run_row["run_id"]
+
+
 class TestStrategyRunError:
     def test_model_dump(self) -> None:
         err = StrategyRunError(

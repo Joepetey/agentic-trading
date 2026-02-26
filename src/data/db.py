@@ -101,6 +101,53 @@ CREATE TABLE IF NOT EXISTS ingest_runs (
   bars_written INTEGER DEFAULT 0,
   error        TEXT
 ) WITHOUT ROWID;
+
+CREATE TABLE IF NOT EXISTS strategy_runs (
+  run_id          TEXT PRIMARY KEY,
+  started_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  finished_at     TEXT,
+  status          TEXT NOT NULL DEFAULT 'running',
+  eval_ts         TEXT NOT NULL,
+  strategies      TEXT,
+  universe_size   INTEGER,
+  signals_written INTEGER DEFAULT 0,
+  errors          INTEGER DEFAULT 0,
+  elapsed_ms      REAL,
+  error           TEXT
+) WITHOUT ROWID;
+
+CREATE TABLE IF NOT EXISTS signals (
+  ts                TEXT NOT NULL,
+  symbol            TEXT NOT NULL,
+  strategy_id       TEXT NOT NULL,
+  strategy_version  TEXT NOT NULL,
+  params_hash       TEXT NOT NULL,
+  side              TEXT NOT NULL,
+  strength          REAL NOT NULL,
+  confidence        REAL NOT NULL,
+  horizon_bars      INTEGER NOT NULL,
+  entry_type        TEXT NOT NULL DEFAULT 'market',
+  entry_price_hint  REAL,
+  stop_price        REAL,
+  take_profit_price REAL,
+  time_stop_bars    INTEGER,
+  invalidate        TEXT,
+  tags              TEXT,
+  explain           TEXT NOT NULL DEFAULT '',
+  run_id            TEXT,
+  created_at        TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  PRIMARY KEY (ts, symbol, strategy_id, strategy_version),
+  FOREIGN KEY (symbol) REFERENCES symbols(symbol)
+) WITHOUT ROWID;
+
+CREATE INDEX IF NOT EXISTS signals_strategy_ts_idx
+  ON signals(strategy_id, ts);
+
+CREATE INDEX IF NOT EXISTS signals_symbol_ts_idx
+  ON signals(symbol, ts DESC);
+
+CREATE INDEX IF NOT EXISTS signals_run_id_idx
+  ON signals(run_id);
 """
 
 # ── Public API ────────────────────────────────────────────────────────
