@@ -29,6 +29,14 @@ max_portfolio_exposure_pct = 0.90
 max_daily_loss_pct = 0.02
 max_open_orders = 10
 
+[orchestrator]
+primary_timeframe = "1Day"
+max_stale_pct = 0.50
+
+[orchestrator.max_staleness]
+"1Day" = 2880
+"5Min" = 30
+
 [strategies]
 enabled = ["sma_crossover", "mean_reversion", "momentum", "tqqq_weekly"]
 

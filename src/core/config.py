@@ -66,6 +66,23 @@ class RiskLimits(BaseModel):
     )
 
 
+class OrchestratorConfig(BaseModel):
+    """Settings for the orchestrator decision cycle (Phase 3)."""
+
+    max_staleness: dict[str, int] = Field(
+        default_factory=lambda: {"1Day": 2880, "5Min": 30},
+        description="Max staleness in minutes per timeframe before a symbol is excluded",
+    )
+    max_stale_pct: float = Field(
+        default=0.50,
+        description="If more than this fraction of symbols are stale, emit NO_TRADE",
+    )
+    primary_timeframe: str = Field(
+        default="1Day",
+        description="Timeframe used for eval_ts resolution",
+    )
+
+
 class StrategyEntry(BaseModel):
     """Per-strategy config from TOML.
 
@@ -112,6 +129,7 @@ class Settings(BaseModel):
     ingest: IngestConfig = Field(default_factory=IngestConfig)
     risk: RiskLimits = Field(default_factory=RiskLimits)
     strategies: StrategyConfig = Field(default_factory=StrategyConfig)
+    orchestrator: OrchestratorConfig = Field(default_factory=OrchestratorConfig)
 
 
 # ── Loading ────────────────────────────────────────────────────────────
@@ -176,4 +194,5 @@ def load_settings(config_path: Path | None = None) -> Settings:
         ingest=IngestConfig(**file_cfg.get("ingest", {})),
         risk=RiskLimits(**file_cfg.get("risk", {})),
         strategies=StrategyConfig(enabled=strat_enabled, entries=strat_entries),
+        orchestrator=OrchestratorConfig(**file_cfg.get("orchestrator", {})),
     )

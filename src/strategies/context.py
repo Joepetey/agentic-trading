@@ -192,6 +192,7 @@ class Constraints(BaseModel):
     max_names: int | None = Field(default=None, description="Max symbols to signal on")
     min_avg_volume: int | None = Field(default=None, description="Min average daily volume")
     min_price: float | None = Field(default=None, description="Min price filter")
+    exclude_symbols: frozenset[str] = Field(default_factory=frozenset, description="Symbols to exclude from universe")
     extras: dict[str, Any] = Field(default_factory=dict, description="Escape hatch for ad-hoc filters")
 
 
