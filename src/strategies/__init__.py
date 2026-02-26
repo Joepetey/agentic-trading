@@ -2,7 +2,13 @@
 
 from src.strategies.base import Strategy
 from src.strategies.context import Constraints, DataAccess, StrategyContext
-from src.strategies.registry import StrategyRegistry, get_default_registry, register
+from src.strategies.tqqq_weekly import TQQQWeekly
+from src.strategies.registry import (
+    StrategyRegistry,
+    get_default_registry,
+    register,
+    register_class,
+)
 from src.strategies.runner import RunResult, StrategyRunError, run_strategies
 from src.strategies.signal import (
     CompareOp,
@@ -27,7 +33,9 @@ __all__ = [
     "StrategyContext",
     "StrategyRegistry",
     "StrategyRunError",
+    "TQQQWeekly",
     "get_default_registry",
     "register",
+    "register_class",
     "run_strategies",
 ]

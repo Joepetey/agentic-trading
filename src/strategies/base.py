@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import abc
+import hashlib
+import json
 import re
+from typing import Any
 
 from src.strategies.context import StrategyContext
 from src.strategies.signal import Signal
@@ -17,7 +20,7 @@ class Strategy(abc.ABC):
     Strategies are **stateless**.  All market state lives in the DB;
     the runner provides a ``StrategyContext`` with a time-bounded DAO.
 
-    Subclasses must implement the four abstract members below.
+    Subclasses must implement the five abstract members below.
     ``healthcheck`` is optional (defaults to ``True``).
     """
 
@@ -44,6 +47,16 @@ class Strategy(abc.ABC):
         ...
 
     @abc.abstractmethod
+    def params(self) -> dict[str, Any]:
+        """Return the strategy's tuneable parameters.
+
+        Used to compute :attr:`params_hash` for reproducibility and
+        audit.  The dict must be JSON-serialisable and deterministic
+        (same config → same dict → same hash).
+        """
+        ...
+
+    @abc.abstractmethod
     def run(self, ctx: StrategyContext) -> list[Signal]:
         """Evaluate the universe and return 0..N signals.
 
@@ -55,6 +68,27 @@ class Strategy(abc.ABC):
     def healthcheck(self, ctx: StrategyContext) -> bool:
         """Optional liveness probe.  Override to add custom checks."""
         return True
+
+    # ── Reproducibility ───────────────────────────────────────────────
+
+    @property
+    def params_hash(self) -> str:
+        """Deterministic SHA-256 of ``(strategy_id, version, params())``.
+
+        Two strategy instances with the same id, version, and params
+        will always produce the same hash.  A change to any of those
+        three produces a different hash.
+        """
+        canonical = json.dumps(
+            {
+                "strategy_id": self.strategy_id,
+                "version": self.version,
+                "params": self.params(),
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        return hashlib.sha256(canonical.encode()).hexdigest()[:16]
 
     # ── Validation helpers ────────────────────────────────────────────
 

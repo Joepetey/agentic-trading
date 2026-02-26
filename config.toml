@@ -12,6 +12,7 @@ symbols = [
     "TSLA",
     "SPY",
     "QQQ",
+    "TQQQ",
 ]
 
 [ingest]
@@ -27,3 +28,30 @@ max_position_pct = 0.05
 max_portfolio_exposure_pct = 0.90
 max_daily_loss_pct = 0.02
 max_open_orders = 10
+
+[strategies]
+enabled = ["sma_crossover", "mean_reversion", "momentum", "tqqq_weekly"]
+
+[strategies.sma_crossover]
+fast_period = 10
+slow_period = 50
+timeframe = "1Day"
+
+[strategies.mean_reversion]
+lookback = 20
+entry_z = 2.0
+timeframe = "1Day"
+
+[strategies.momentum]
+lookback = 14
+threshold_pct = 2.0
+timeframe = "1Day"
+
+[strategies.tqqq_weekly]
+symbol = "TQQQ"
+profit_target_a = 0.081
+profit_target_carlos = 0.025
+stop_trigger_close = -0.013
+stop_exit = -0.015
+stop_exit_method = "moo"
+timeframe = "1Day"

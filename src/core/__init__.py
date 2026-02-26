@@ -6,6 +6,8 @@ from src.core.config import (
     IngestConfig,
     RiskLimits,
     Settings,
+    StrategyConfig,
+    StrategyEntry,
     SymbolUniverse,
     load_settings,
 )
@@ -41,6 +43,8 @@ __all__ = [
     "RiskViolation",
     "Settings",
     "StaleDataError",
+    "StrategyConfig",
+    "StrategyEntry",
     "StrategyError",
     "SymbolUniverse",
     "TradingError",

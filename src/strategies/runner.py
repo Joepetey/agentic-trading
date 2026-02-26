@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import sqlite3
 import time
+from concurrent.futures import Future, ThreadPoolExecutor, TimeoutError
 from datetime import datetime
 from typing import Any
 
@@ -16,6 +17,10 @@ from src.strategies.context import Constraints, DataAccess, StrategyContext
 from src.strategies.signal import Signal
 
 logger = structlog.get_logger(__name__)
+
+# Defaults
+_DEFAULT_MAX_WORKERS = 4
+_DEFAULT_TIMEOUT_SECS = 30.0
 
 
 # ── Result types ──────────────────────────────────────────────────────
@@ -43,6 +48,42 @@ class RunResult(BaseModel):
     strategies_run: int
 
 
+# ── Internals ────────────────────────────────────────────────────────
+
+
+def _validate_signals(signals: Any, strategy_id: str) -> list[Signal]:
+    """Validate the return value from ``Strategy.run()``.
+
+    Raises StrategyError on type mismatches or mismatched strategy_id.
+    """
+    if not isinstance(signals, list):
+        raise StrategyError(
+            f"{strategy_id}.run() returned {type(signals).__name__}, expected list"
+        )
+
+    for sig in signals:
+        if not isinstance(sig, Signal):
+            raise StrategyError(
+                f"{strategy_id}.run() emitted {type(sig).__name__}, expected Signal"
+            )
+        if sig.strategy_id != strategy_id:
+            raise StrategyError(
+                f"Signal strategy_id {sig.strategy_id!r} "
+                f"does not match {strategy_id!r}"
+            )
+
+    return signals
+
+
+def _run_one(strategy: Strategy, ctx: StrategyContext) -> list[Signal]:
+    """Execute a single strategy and validate its output.
+
+    This function runs inside a worker thread when parallel mode is used.
+    """
+    result = strategy.run(ctx)
+    return _validate_signals(result, strategy.strategy_id)
+
+
 # ── Runner ────────────────────────────────────────────────────────────
 
 
@@ -53,22 +94,34 @@ def run_strategies(
     now_ts: datetime,
     config_map: dict[str, dict[str, Any]] | None = None,
     constraints: Constraints | None = None,
+    *,
+    max_workers: int = 1,
+    strategy_timeout_secs: float | None = _DEFAULT_TIMEOUT_SECS,
 ) -> RunResult:
     """Run every strategy against the universe, collecting signals and errors.
 
     Error isolation: a failure in one strategy is logged and recorded
     but does not affect other strategies.
 
-    Execution is sequential — SQLite doesn't benefit from concurrent
-    reads on the same connection, and strategy evaluation is CPU-light.
+    Parallelism is by *strategy* (not symbol).  Data prefetch happens
+    sequentially on the calling thread (SQLite reads), then each
+    strategy's ``run()`` executes in a thread pool.
+
+    When ``max_workers=1`` (the default) execution is fully sequential
+    with no thread-pool overhead.
 
     Args:
-        strategies:  Strategy instances to evaluate.
-        universe:    Ticker symbols.
-        conn:        SQLite connection (read-only usage).
-        now_ts:      Point-in-time for evaluation.
-        config_map:  Per-strategy config dicts, keyed by strategy_id.
-        constraints: Pre-evaluation filters.
+        strategies:      Strategy instances to evaluate.
+        universe:        Ticker symbols.
+        conn:            SQLite connection (read-only usage).
+        now_ts:          Point-in-time for evaluation.
+        config_map:      Per-strategy config dicts, keyed by strategy_id.
+        constraints:     Pre-evaluation filters.
+        max_workers:     Thread-pool size.  ``1`` → sequential (no pool).
+        strategy_timeout_secs:
+            Per-strategy time budget in seconds.  ``None`` → no limit.
+            A strategy that exceeds its budget is recorded as a
+            ``StrategyRunError`` with ``error_type="TimeoutError"``.
 
     Returns:
         RunResult with signals sorted by descending |strength|.
@@ -82,22 +135,20 @@ def run_strategies(
         strategy_count=len(strategies),
         symbol_count=len(universe),
         as_of=now_ts.isoformat(),
+        max_workers=max_workers,
     )
     run_log.info("run_start")
 
     t0 = time.monotonic()
-    signals: list[Signal] = []
-    errors: list[StrategyRunError] = []
 
+    # ── Phase 1: prefetch data (sequential, main thread) ────────────
+    #
+    # SQLite doesn't benefit from concurrent reads on the same
+    # connection, so we pull all bar data before fanning out.
+    prepared: list[tuple[Strategy, StrategyContext]] = []
     for strategy in strategies:
-        sid = strategy.strategy_id
-        ver = strategy.version
-        strat_log = run_log.bind(strategy_id=sid, version=ver)
-
         dao = DataAccess(conn, now_ts)
         primary_tf = strategy.required_timeframes()[0]
-
-        # Batch-prefetch bar windows for the whole universe in one query.
         dao.prefetch(list(universe_tuple), primary_tf, strategy.required_lookback_bars())
 
         ctx = StrategyContext(
@@ -105,50 +156,23 @@ def run_strategies(
             universe=universe_tuple,
             timeframe=primary_tf,
             data=dao,
-            config=config_map.get(sid, {}),
+            config=config_map.get(strategy.strategy_id, {}),
             constraints=constraints,
         )
+        prepared.append((strategy, ctx))
 
-        try:
-            result = strategy.run(ctx)
+    # ── Phase 2: execute strategies ─────────────────────────────────
+    signals: list[Signal] = []
+    errors: list[StrategyRunError] = []
 
-            # Validate return type
-            if not isinstance(result, list):
-                raise StrategyError(
-                    f"{sid}.run() returned {type(result).__name__}, expected list"
-                )
+    if max_workers <= 1 or len(strategies) <= 1:
+        # Fast path: no thread-pool overhead.
+        for strategy, ctx in prepared:
+            _execute_strategy(strategy, ctx, strategy_timeout_secs, signals, errors, run_log)
+    else:
+        _execute_parallel(prepared, max_workers, strategy_timeout_secs, signals, errors, run_log)
 
-            for sig in result:
-                if not isinstance(sig, Signal):
-                    raise StrategyError(
-                        f"{sid}.run() emitted {type(sig).__name__}, expected Signal"
-                    )
-                if sig.strategy_id != sid:
-                    raise StrategyError(
-                        f"Signal strategy_id {sig.strategy_id!r} "
-                        f"does not match {sid!r}"
-                    )
-
-            signals.extend(result)
-            strat_log.info(
-                "strategy_complete",
-                signal_count=len(result),
-            )
-
-        except Exception as exc:
-            error = StrategyRunError(
-                strategy_id=sid,
-                version=ver,
-                error_type=type(exc).__name__,
-                error_message=str(exc),
-            )
-            errors.append(error)
-            strat_log.warning(
-                "strategy_failed",
-                error_type=error.error_type,
-                error_message=error.error_message,
-            )
-
+    # ── Phase 3: aggregate results ──────────────────────────────────
     elapsed_ms = (time.monotonic() - t0) * 1000
     signals.sort()
 
@@ -167,3 +191,112 @@ def run_strategies(
     )
 
     return result
+
+
+def _execute_strategy(
+    strategy: Strategy,
+    ctx: StrategyContext,
+    timeout_secs: float | None,
+    signals: list[Signal],
+    errors: list[StrategyRunError],
+    run_log: Any,
+) -> None:
+    """Run a single strategy synchronously with optional timeout.
+
+    For the sequential path (max_workers=1), timeout is enforced via a
+    single-thread pool so we can still interrupt hung strategies.
+    """
+    sid = strategy.strategy_id
+    ver = strategy.version
+    strat_log = run_log.bind(
+        strategy_id=sid, version=ver, params_hash=strategy.params_hash,
+    )
+
+    try:
+        if timeout_secs is not None:
+            # Use a one-off thread to enforce the timeout even in
+            # sequential mode.
+            with ThreadPoolExecutor(max_workers=1) as mini_pool:
+                future = mini_pool.submit(_run_one, strategy, ctx)
+                result = future.result(timeout=timeout_secs)
+        else:
+            result = _run_one(strategy, ctx)
+
+        signals.extend(result)
+        strat_log.info("strategy_complete", signal_count=len(result))
+
+    except TimeoutError:
+        error = StrategyRunError(
+            strategy_id=sid,
+            version=ver,
+            error_type="TimeoutError",
+            error_message=f"{sid} exceeded time budget of {timeout_secs}s",
+        )
+        errors.append(error)
+        strat_log.warning("strategy_timeout", timeout_secs=timeout_secs)
+
+    except Exception as exc:
+        error = StrategyRunError(
+            strategy_id=sid,
+            version=ver,
+            error_type=type(exc).__name__,
+            error_message=str(exc),
+        )
+        errors.append(error)
+        strat_log.warning(
+            "strategy_failed",
+            error_type=error.error_type,
+            error_message=error.error_message,
+        )
+
+
+def _execute_parallel(
+    prepared: list[tuple[Strategy, StrategyContext]],
+    max_workers: int,
+    timeout_secs: float | None,
+    signals: list[Signal],
+    errors: list[StrategyRunError],
+    run_log: Any,
+) -> None:
+    """Fan out strategy execution across a thread pool."""
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        future_to_strategy: dict[Future[list[Signal]], Strategy] = {}
+        for strategy, ctx in prepared:
+            future = pool.submit(_run_one, strategy, ctx)
+            future_to_strategy[future] = strategy
+
+        for future, strategy in future_to_strategy.items():
+            sid = strategy.strategy_id
+            ver = strategy.version
+            strat_log = run_log.bind(
+                strategy_id=sid, version=ver, params_hash=strategy.params_hash,
+            )
+
+            try:
+                result = future.result(timeout=timeout_secs)
+                signals.extend(result)
+                strat_log.info("strategy_complete", signal_count=len(result))
+
+            except TimeoutError:
+                error = StrategyRunError(
+                    strategy_id=sid,
+                    version=ver,
+                    error_type="TimeoutError",
+                    error_message=f"{sid} exceeded time budget of {timeout_secs}s",
+                )
+                errors.append(error)
+                strat_log.warning("strategy_timeout", timeout_secs=timeout_secs)
+
+            except Exception as exc:
+                error = StrategyRunError(
+                    strategy_id=sid,
+                    version=ver,
+                    error_type=type(exc).__name__,
+                    error_message=str(exc),
+                )
+                errors.append(error)
+                strat_log.warning(
+                    "strategy_failed",
+                    error_type=error.error_type,
+                    error_message=error.error_message,
+                )

@@ -6,8 +6,9 @@ import os
 import tomllib
 from enum import Enum
 from pathlib import Path
+from typing import Any
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 # ── Enums ──────────────────────────────────────────────────────────────
 
@@ -65,11 +66,52 @@ class RiskLimits(BaseModel):
     )
 
 
+class StrategyEntry(BaseModel):
+    """Per-strategy config from TOML.
+
+    All keys become the strategy's params dict, except the reserved
+    ``max_names`` / ``min_avg_volume`` / ``min_price`` fields which
+    are extracted as per-strategy constraint overrides.
+    """
+
+    model_config = ConfigDict(extra="allow")
+
+    max_names: int | None = Field(default=None, description="Per-strategy max symbols to signal on")
+    min_avg_volume: int | None = Field(default=None, description="Per-strategy min avg daily volume")
+    min_price: float | None = Field(default=None, description="Per-strategy min price filter")
+
+    def strategy_params(self) -> dict[str, Any]:
+        """Return only the tuneable strategy params (excludes constraint fields)."""
+        reserved = {"max_names", "min_avg_volume", "min_price"}
+        return {k: v for k, v in self.model_dump().items() if k not in reserved}
+
+    def constraint_overrides(self) -> dict[str, Any]:
+        """Return the per-strategy constraint overrides (only non-None)."""
+        out: dict[str, Any] = {}
+        if self.max_names is not None:
+            out["max_names"] = self.max_names
+        if self.min_avg_volume is not None:
+            out["min_avg_volume"] = self.min_avg_volume
+        if self.min_price is not None:
+            out["min_price"] = self.min_price
+        return out
+
+
+class StrategyConfig(BaseModel):
+    """Top-level ``[strategies]`` section from config.toml."""
+
+    enabled: list[str] = Field(default_factory=list, description="Strategy IDs to run")
+    entries: dict[str, StrategyEntry] = Field(
+        default_factory=dict, description="Per-strategy config, keyed by strategy_id",
+    )
+
+
 class Settings(BaseModel):
     alpaca: AlpacaConfig
     symbols: SymbolUniverse = Field(default_factory=SymbolUniverse)
     ingest: IngestConfig = Field(default_factory=IngestConfig)
     risk: RiskLimits = Field(default_factory=RiskLimits)
+    strategies: StrategyConfig = Field(default_factory=StrategyConfig)
 
 
 # ── Loading ────────────────────────────────────────────────────────────
@@ -113,6 +155,16 @@ def load_settings(config_path: Path | None = None) -> Settings:
         "ALPACA_BASE_URL", file_cfg.get("alpaca", {}).get("base_url", "")
     )
 
+    # ── Parse [strategies] section ───────────────────────────────────
+    raw_strats = file_cfg.get("strategies", {})
+    strat_enabled = raw_strats.get("enabled", [])
+    strat_entries: dict[str, StrategyEntry] = {}
+    for key, val in raw_strats.items():
+        if key == "enabled":
+            continue
+        if isinstance(val, dict):
+            strat_entries[key] = StrategyEntry(**val)
+
     return Settings(
         alpaca=AlpacaConfig(
             env=env,
@@ -123,4 +175,5 @@ def load_settings(config_path: Path | None = None) -> Settings:
         symbols=SymbolUniverse(**file_cfg.get("symbols", {})),
         ingest=IngestConfig(**file_cfg.get("ingest", {})),
         risk=RiskLimits(**file_cfg.get("risk", {})),
+        strategies=StrategyConfig(enabled=strat_enabled, entries=strat_entries),
     )
