@@ -1,1 +1,0 @@
-"""Backtest — event replay harness."""

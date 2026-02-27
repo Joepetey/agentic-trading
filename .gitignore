@@ -1,17 +1,5 @@
-# Python-generated files
-__pycache__/
-*.py[oc]
-build/
-dist/
-wheels/
-*.egg-info
-
-# Virtual environments
-.venv
-
-# Database
-db/*
-!db/.gitkeep
-
-# Secrets
 .env
+.venv/
+__pycache__/
+*.pyc
+*.db
