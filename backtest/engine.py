@@ -60,13 +60,33 @@ def run_backtest(
     entry_day_offset: int = 0,
     entry_price_override: dict[date, float] | None = None,
     exit_price_override: dict[date, float] | None = None,
+    max_reentries_per_week: int = 0,
+    reentry_cooldown_days: int = 0,
+    weekend_hold_mode: str = "never",
 ) -> BacktestResult:
-    """Run a deterministic daily-loop backtest."""
+    """Run a deterministic daily-loop backtest.
+
+    Args:
+        weekend_hold_mode: When to hold over the weekend instead of EOW exit.
+            "never" (default): always exit Friday close.
+            "always": never EOW exit (only via TP/stop).
+            "profitable": hold if Friday close > entry price.
+            "sma20": hold if Friday close > 20-day SMA.
+            "sma50": hold if Friday close > 50-day SMA.
+    """
     if not bars:
         return BacktestResult([], [], initial_cash, initial_cash)
 
     symbol = bars[0].symbol
     sim = _SimState(cash=initial_cash)
+
+    # Pre-compute SMA for weekend hold mode
+    sma_map: dict[date, float] = {}
+    if weekend_hold_mode in ("sma20", "sma50"):
+        period = 20 if weekend_hold_mode == "sma20" else 50
+        closes = [b.close for b in bars]
+        for j in range(period - 1, len(bars)):
+            sma_map[bars[j].ts.date()] = sum(closes[j - period + 1 : j + 1]) / period
 
     # Pre-compute first/last trading days per ISO week to avoid repeated lookups
     week_cache: dict[str, tuple[date, date]] = {}
@@ -284,15 +304,39 @@ def run_backtest(
         if filled:
             sim.open_orders.clear()  # OCO
 
+    # ---- Helper to detect exit after a position-reducing operation ----
+    def _detect_exit(prev_qty: float, bar_idx: int) -> tuple[int | None, str | None]:
+        """If position went from held to flat, return (bar_idx, exit_reason)."""
+        if prev_qty > 0 and sim.pos_qty == 0:
+            reason = None
+            for t in reversed(sim.trades):
+                if t.symbol == symbol:
+                    reason = t.exit_reason
+                    break
+            return bar_idx, reason
+        return None, None
+
+    # ---- Re-entry state (reset each week) ----
+    reentry_count = 0
+    exit_bar_idx: int | None = None
+    last_exit_reason: str | None = None
+
     # ---- Main loop ----
-    for bar in bars:
+    for i, bar in enumerate(bars):
         today = bar.ts.date()
         week_id, first_day, last_day = _week_bounds(today)
         bil_bar = sweep_bars.get(today) if sweep_bars else None
 
+        is_first = today == first_day
+        is_last = today == last_day
+
         # Check pending open orders (market-on-open sells, limit fills)
+        prev_qty = sim.pos_qty
         if sim.pos_qty > 0:
             _check_open_orders(bar)
+        eidx, ereason = _detect_exit(prev_qty, i)
+        if eidx is not None:
+            exit_bar_idx, last_exit_reason = eidx, ereason
 
         # If position was closed by an open order, sync strategy state
         if sim.pos_qty == 0 and sim.strategy_state and sim.strategy_state.position_open:
@@ -300,15 +344,16 @@ def run_backtest(
                 update={"position_open": False, "active_exit_tag": None, "stop_pending": False}
             )
 
-        # Week start
-        is_first = today == first_day
-        is_last = today == last_day
-
         # Sweep OUT of BIL before TQQQ entry (cash must be available for full_exposure sizing)
         if is_first and sim.bil_qty > 0 and bil_bar:
             _sweep_out_of_bil(bil_bar, today)
 
         if is_first:
+            # Reset re-entry tracking for the new week
+            reentry_count = 0
+            exit_bar_idx = None
+            last_exit_reason = None
+
             bil_val = sim.bil_qty * bil_bar.close if bil_bar and sim.bil_qty > 0 else 0.0
             pv = sim.cash + sim.pos_qty * bar.open + bil_val
 
@@ -335,18 +380,76 @@ def run_backtest(
             _process_intents(intents, bar, "week_start")
 
             # After entry, check if limit TP fills today
+            prev_qty = sim.pos_qty
             if sim.pos_qty > 0:
                 _check_open_orders(bar)
+            eidx, ereason = _detect_exit(prev_qty, i)
+            if eidx is not None:
+                exit_bar_idx, last_exit_reason = eidx, ereason
 
-        # Daily close logic (only if holding, skip on last day — rule 5 EOW is absolute)
-        if sim.pos_qty > 0 and sim.strategy_state and not is_last:
+        # ---- Mid-week re-entry ----
+        elif (
+            not is_last
+            and sim.pos_qty == 0
+            and max_reentries_per_week > 0
+            and reentry_count < max_reentries_per_week
+            and exit_bar_idx is not None
+            and (i - exit_bar_idx) > reentry_cooldown_days
+            and last_exit_reason in ("TP_C", "STOP")
+        ):
+            # Sweep out of BIL to free cash
+            if sim.bil_qty > 0 and bil_bar:
+                _sweep_out_of_bil(bil_bar, today)
+
+            bil_val = sim.bil_qty * bil_bar.close if bil_bar and sim.bil_qty > 0 else 0.0
+            pv = sim.cash + bil_val
+
+            sim.strategy_state = StrategyState(
+                week_id=week_id,
+                symbol=symbol,
+                mode="NORMAL",
+                position_open=False,
+                portfolio_value=pv,
+            )
+
+            intents, sim.strategy_state = strategy.on_week_start(bar, sim.strategy_state)
+            _process_intents(intents, bar, "week_start")
+
+            if sim.pos_qty > 0:
+                reentry_count += 1
+
+            # Check same-day TP fills
+            prev_qty = sim.pos_qty
+            if sim.pos_qty > 0:
+                _check_open_orders(bar)
+            eidx, ereason = _detect_exit(prev_qty, i)
+            if eidx is not None:
+                exit_bar_idx, last_exit_reason = eidx, ereason
+
+        # Daily close + week end logic
+        if is_last and sim.pos_qty > 0 and sim.strategy_state:
+            # Decide whether to hold over the weekend
+            hold_weekend = False
+            if weekend_hold_mode == "always":
+                hold_weekend = True
+            elif weekend_hold_mode == "profitable":
+                hold_weekend = bar.close > sim.pos_avg_entry
+            elif weekend_hold_mode in ("sma20", "sma50"):
+                sma_val = sma_map.get(today)
+                hold_weekend = sma_val is not None and bar.close > sma_val
+
+            if hold_weekend:
+                # Holding: run daily_close for stop checks on Friday
+                intents, sim.strategy_state = strategy.on_daily_close(bar, sim.strategy_state)
+                _process_intents(intents, bar, "daily_close")
+            else:
+                # Normal EOW exit at close on last trading day (rule 5)
+                intents, sim.strategy_state = strategy.on_week_end(bar, sim.strategy_state)
+                _process_intents(intents, bar, "week_end")
+        elif sim.pos_qty > 0 and sim.strategy_state and not is_last:
+            # Mon-Thu daily close (stop trigger, weakness mode)
             intents, sim.strategy_state = strategy.on_daily_close(bar, sim.strategy_state)
             _process_intents(intents, bar, "daily_close")
-
-        # Week end — always exit at close on last trading day (rule 5)
-        if is_last and sim.pos_qty > 0 and sim.strategy_state:
-            intents, sim.strategy_state = strategy.on_week_end(bar, sim.strategy_state)
-            _process_intents(intents, bar, "week_end")
 
         # Sweep idle cash into BIL if flat on TQQQ
         if sweep_bars and bil_bar and sim.pos_qty == 0 and sim.bil_qty == 0:
